@@ -1,0 +1,14 @@
+node_modules
+dist
+uploads/*
+!uploads/.gitkeep
+.env
+.env.*
+.git
+.gitignore
+npm-debug.log
+test
+*.spec.ts
+*.e2e-spec.ts
+vitest.config.ts
+vitest.config.e2e.ts
