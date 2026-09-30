@@ -13,6 +13,8 @@ import { RealtimeModule } from './realtime/realtime.module.js';
 import { WhiteboardModule } from './whiteboard/whiteboard.module.js';
 import { PdfModule } from './pdf/pdf.module.js';
 import { WebrtcModule } from './webrtc/webrtc.module.js';
+import { MailModule } from './mail/mail.module.js';
+import { SmsModule } from './sms/sms.module.js';
 
 const mongooseLogger = new Logger('MongoDBAtlas');
 
@@ -42,9 +44,10 @@ const mongooseLogger = new Logger('MongoDBAtlas');
 
         return {
           uri,
+          dbName: 'classroom-lite',
           connectionFactory: (connection: Connection) => {
             connection.on('connected', () => {
-              mongooseLogger.log('MongoDB Atlas connected');
+              mongooseLogger.log(`MongoDB Atlas connected (database: ${connection.name})`);
             });
 
             connection.on('error', (error: any) => {
@@ -72,6 +75,8 @@ const mongooseLogger = new Logger('MongoDBAtlas');
     WhiteboardModule,
     PdfModule,
     WebrtcModule,
+    MailModule,
+    SmsModule,
   ],
 })
 export class AppModule {}

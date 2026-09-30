@@ -70,6 +70,30 @@ export class ClassroomsController {
     return this.classroomsService.getStudentHistory(user.id);
   }
 
+  @Get('recent')
+  @ApiOperation({
+    summary: 'Dashboard: Get recent classrooms created or joined with live status (ACTIVE or ENDED)',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Recent classrooms with real-time status returned',
+  })
+  async getRecent(@CurrentUser() user: AuthenticatedUser) {
+    return this.classroomsService.getRecentClassrooms(user.id);
+  }
+
+  @Get('analytics')
+  @ApiOperation({
+    summary: 'Dashboard: Get aggregated teaching and learning analytics',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Classroom analytics data returned for host or student',
+  })
+  async getAnalytics(@CurrentUser() user: AuthenticatedUser) {
+    return this.classroomsService.getAnalytics(user.id);
+  }
+
   // ==========================================
   // CLASSROOM SPECIFIC ENDPOINTS
   // ==========================================

@@ -23,6 +23,7 @@ import { WhiteboardService } from '../whiteboard/whiteboard.service.js';
 import { PdfService } from '../pdf/pdf.service.js';
 import { WebrtcService } from '../webrtc/webrtc.service.js';
 import { formatDuration } from '../common/utils/format-duration.util.js';
+import { parseAllowedOrigins, isOriginAllowed } from '../common/utils/cors.util.js';
 import {
   ClassroomStatus,
   ClassroomEndedReason,
@@ -44,7 +45,14 @@ import { WebrtcSignalDto } from '../webrtc/dto/webrtc-signal.dto.js';
 @WebSocketGateway({
   namespace: '/classroom',
   cors: {
-    origin: true,
+    origin: (origin: string, callback: (err: Error | null, allow?: boolean) => void) => {
+      const allowedOrigins = parseAllowedOrigins(process.env.FRONTEND_URL);
+      if (isOriginAllowed(origin, allowedOrigins)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`WebSocket origin ${origin} not allowed by CORS`));
+      }
+    },
     credentials: true,
   },
 })
@@ -68,6 +76,26 @@ export class ClassroomGateway
   // Map: classroomCode -> Map<userId, { userName: string; hasVideo: boolean }>
   private readonly voiceChatActivePeers = new Map<string, Map<string, { userName: string; hasVideo: boolean }>>();
 
+  // Inactivity & Session Duration Rules:
+  // 1. Auto-end classroom if 0 active participants or no activity for 5 minutes
+  private readonly INACTIVITY_LIMIT_MS = 5 * 60 * 1000; // 5 minutes (300,000 ms)
+
+  // 2. Maximum session duration of 2 hours, with a warning 5 minutes before
+  private readonly MAX_SESSION_DURATION_MS = 2 * 60 * 60 * 1000; // 2 hours (7,200,000 ms)
+  private readonly WARNING_BEFORE_END_MS = 5 * 60 * 1000; // 5 minutes (300,000 ms)
+
+  // Map: classroomCode -> timestamp of last recorded activity
+  private readonly classroomLastActivity = new Map<string, number>();
+
+  // Map: classroomCode -> NodeJS.Timeout for 2-hour max duration
+  private readonly maxDurationTimers = new Map<string, NodeJS.Timeout>();
+
+  // Map: classroomCode -> NodeJS.Timeout for 5-minute warning before 2 hours
+  private readonly warningTimers = new Map<string, NodeJS.Timeout>();
+
+  // Set: classroomCodes where 5-min warning before 2 hours was already issued
+  private readonly warningIssuedClassrooms = new Set<string>();
+
   constructor(
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
@@ -81,60 +109,79 @@ export class ClassroomGateway
     private readonly participantModel: Model<ParticipantDocument>,
   ) {}
 
-  afterInit() {
-    this.logger.log('ClassroomGateway initialized on namespace /classroom');
+  afterInit(server: Server) {
+    // Socket.IO authentication and origin middleware: runs BEFORE any event can be received!
+    server.use(async (socket: Socket, next: (err?: Error) => void) => {
+      try {
+        const origin = socket.handshake.headers?.origin;
+        const allowedOrigins = parseAllowedOrigins(
+          this.configService.get<string>('frontendUrl') || process.env.FRONTEND_URL,
+        );
+        if (origin && !isOriginAllowed(origin, allowedOrigins)) {
+          this.logger.warn(
+            `Socket rejected: Unauthorized origin '${origin}' (${socket.id})`,
+          );
+          return next(new Error(`Unauthorized origin: ${origin}`));
+        }
+
+        let token =
+          socket.handshake.auth?.token ||
+          socket.handshake.headers?.authorization;
+
+        if (!token) {
+          this.logger.warn(`Socket rejected: No token provided (${socket.id})`);
+          return next(new Error('Unauthorized: No token provided'));
+        }
+
+        if (token.startsWith('Bearer ')) {
+          token = token.slice(7).trim();
+        }
+
+        const secret =
+          this.configService.get<string>('jwtSecret') ||
+          this.configService.get<string>('JWT_SECRET') ||
+          'tdp-classroom-lite-jwt-secret-key-2025';
+
+        const payload = this.jwtService.verify<JwtPayload>(token, { secret });
+        const user = await this.usersService.findById(payload.sub);
+
+        if (!user) {
+          this.logger.warn(`Socket rejected: User ${payload.sub} not found`);
+          return next(new Error('Unauthorized: User not found'));
+        }
+
+        const authenticatedUser: AuthenticatedUser = {
+          id: user._id.toString(),
+          email: user.email,
+          name: user.name,
+          avatar: user.avatar,
+        };
+
+        socket.data.user = authenticatedUser;
+        next();
+      } catch (error: any) {
+        this.logger.warn(`Socket auth middleware error: ${error.message} (${socket.id})`);
+        next(new Error(`Unauthorized: ${error.message}`));
+      }
+    });
+
+    this.logger.log('ClassroomGateway initialized on namespace /classroom with auth middleware');
   }
 
   async handleConnection(client: Socket) {
-    try {
-      let token =
-        client.handshake.auth?.token ||
-        client.handshake.headers?.authorization;
-
-      if (!token) {
-        this.logger.warn(`Socket connection rejected: No token provided (${client.id})`);
-        client.disconnect(true);
-        return;
-      }
-
-      if (token.startsWith('Bearer ')) {
-        token = token.slice(7).trim();
-      }
-
-      const secret =
-        this.configService.get<string>('jwtSecret') ||
-        this.configService.get<string>('JWT_SECRET') ||
-        'tdp-classroom-lite-jwt-secret-key-2025';
-
-      const payload = this.jwtService.verify<JwtPayload>(token, { secret });
-      const user = await this.usersService.findById(payload.sub);
-
-      if (!user) {
-        this.logger.warn(`Socket connection rejected: User ${payload.sub} not found`);
-        client.disconnect(true);
-        return;
-      }
-
-      const authenticatedUser: AuthenticatedUser = {
-        id: user._id.toString(),
-        email: user.email,
-        name: user.name,
-        avatar: user.avatar,
-      };
-
-      client.data.user = authenticatedUser;
-
-      // Track socket ID under user
-      if (!this.userSockets.has(authenticatedUser.id)) {
-        this.userSockets.set(authenticatedUser.id, new Set());
-      }
-      this.userSockets.get(authenticatedUser.id)!.add(client.id);
-
-      this.logger.log(`Socket connected: ${client.id} (User: ${user.name} - ${user.email})`);
-    } catch (error: any) {
-      this.logger.warn(`Socket authentication failed: ${error.message} (${client.id})`);
+    const user = client.data.user as AuthenticatedUser | undefined;
+    if (!user) {
       client.disconnect(true);
+      return;
     }
+
+    // Track socket ID under user
+    if (!this.userSockets.has(user.id)) {
+      this.userSockets.set(user.id, new Set());
+    }
+    this.userSockets.get(user.id)!.add(client.id);
+
+    this.logger.log(`Socket connected: ${client.id} (User: ${user.name} - ${user.email})`);
   }
 
   async handleDisconnect(client: Socket) {
@@ -170,7 +217,31 @@ export class ClassroomGateway
 
   // Helper method: get authenticated user from socket
   private getAuthUser(client: Socket): AuthenticatedUser {
-    const user = client.data.user as AuthenticatedUser;
+    let user = client.data.user as AuthenticatedUser | undefined;
+    if (!user) {
+      // Fallback: synchronous parse from handshake token if possible
+      try {
+        let token = client.handshake.auth?.token || client.handshake.headers?.authorization;
+        if (token) {
+          if (token.startsWith('Bearer ')) token = token.slice(7).trim();
+          const secret =
+            this.configService.get<string>('jwtSecret') ||
+            this.configService.get<string>('JWT_SECRET') ||
+            'tdp-classroom-lite-jwt-secret-key-2025';
+          const payload = this.jwtService.verify<JwtPayload>(token, { secret });
+          if (payload?.sub) {
+            user = {
+              id: payload.sub,
+              email: payload.email || '',
+              name: (payload as any).name || 'User',
+              avatar: (payload as any).avatar || null,
+            };
+            client.data.user = user;
+          }
+        }
+      } catch {}
+    }
+
     if (!user) {
       throw new WsException('Unauthorized: No authenticated user session found');
     }
@@ -178,46 +249,174 @@ export class ClassroomGateway
   }
 
   // ==========================================
-  // INACTIVITY TIMERS & TRACKING
+  // INACTIVITY & SESSION DURATION TIMERS
   // ==========================================
+
+  /**
+   * Resets the 5-minute idle inactivity timer whenever ANY user activity occurs
+   */
+  recordActivity(classroomCode: string) {
+    if (!classroomCode) return;
+    const code = classroomCode.toUpperCase().trim();
+    this.classroomLastActivity.set(code, Date.now());
+    this.scheduleInactivityTimer(code, this.INACTIVITY_LIMIT_MS);
+  }
 
   scheduleInitialInactivityTimer(classroomCode: string, delayMs = 300000) {
     this.scheduleInactivityTimer(classroomCode, delayMs);
   }
 
-  scheduleInactivityTimer(classroomCode: string, delayMs = 60000) {
-    this.clearInactivityTimer(classroomCode);
+  scheduleInactivityTimer(classroomCode: string, delayMs = 300000) {
+    const code = classroomCode.toUpperCase().trim();
+    this.clearInactivityTimer(code);
 
     const timer = setTimeout(async () => {
       try {
-        const activeSet = this.classroomActiveUsers.get(classroomCode);
-        if (!activeSet || activeSet.size === 0) {
+        const activeSet = this.classroomActiveUsers.get(code);
+        const lastActivity = this.classroomLastActivity.get(code) || 0;
+        const now = Date.now();
+        const isIdleFor5Mins = lastActivity > 0 && now - lastActivity >= this.INACTIVITY_LIMIT_MS;
+        const isEmpty = !activeSet || activeSet.size === 0;
+
+        if (isEmpty) {
           this.logger.warn(
-            `Classroom [${classroomCode}] has had 0 active participants for ${Math.round(
-              delayMs / 1000,
-            )}s. Auto-ending classroom.`,
+            `Classroom [${code}] has had 0 active participants for 5 minutes. Auto-ending classroom.`,
           );
-          await this.autoEndClassroomDueToInactivity(classroomCode);
-          this.classroomActiveUsers.delete(classroomCode);
-          this.inactivityTimers.delete(classroomCode);
+          await this.autoEndClassroomDueToInactivity(
+            code,
+            'Classroom was automatically closed: no participants connected for 5 minutes.',
+          );
+        } else if (isIdleFor5Mins) {
+          this.logger.warn(
+            `Classroom [${code}] has been inactive for 5 minutes. Auto-ending classroom.`,
+          );
+          await this.autoEndClassroomDueToInactivity(
+            code,
+            'Classroom was automatically closed due to 5 minutes of inactivity.',
+          );
         }
       } catch (err: any) {
-        this.logger.error(`Error auto-ending classroom ${classroomCode}: ${err.message}`);
+        this.logger.error(`Error auto-ending classroom ${code}: ${err.message}`);
       }
     }, delayMs);
 
-    this.inactivityTimers.set(classroomCode, timer);
+    this.inactivityTimers.set(code, timer);
   }
 
   clearInactivityTimer(classroomCode: string) {
-    const timer = this.inactivityTimers.get(classroomCode);
+    const code = classroomCode.toUpperCase().trim();
+    const timer = this.inactivityTimers.get(code);
     if (timer) {
       clearTimeout(timer);
-      this.inactivityTimers.delete(classroomCode);
+      this.inactivityTimers.delete(code);
     }
   }
 
-  async autoEndClassroomDueToInactivity(code: string) {
+  clearAllClassroomTimers(classroomCode: string) {
+    const code = classroomCode.toUpperCase().trim();
+    this.clearInactivityTimer(code);
+
+    const maxTimer = this.maxDurationTimers.get(code);
+    if (maxTimer) {
+      clearTimeout(maxTimer);
+      this.maxDurationTimers.delete(code);
+    }
+
+    const warnTimer = this.warningTimers.get(code);
+    if (warnTimer) {
+      clearTimeout(warnTimer);
+      this.warningTimers.delete(code);
+    }
+
+    this.warningIssuedClassrooms.delete(code);
+    this.classroomLastActivity.delete(code);
+  }
+
+  /**
+   * Enforces 2-hour maximum classroom session limit with 5-minute advance warning
+   */
+  ensureClassroomTimers(classroom: ClassroomDocument) {
+    const code = classroom.code.toUpperCase().trim();
+    if (classroom.status === ClassroomStatus.ENDED) return;
+
+    const createdAtMs = new Date(classroom.createdAt).getTime();
+    const nowMs = Date.now();
+    const elapsedMs = Math.max(0, nowMs - createdAtMs);
+    const remainingMs = this.MAX_SESSION_DURATION_MS - elapsedMs;
+
+    if (remainingMs <= 0) {
+      // Exceeded 2 hours already; terminate immediately
+      this.autoEndClassroomDueToTimeLimit(code);
+      return;
+    }
+
+    // Schedule 2-hour max duration timer if not yet scheduled
+    if (!this.maxDurationTimers.has(code)) {
+      const endTimer = setTimeout(() => {
+        this.autoEndClassroomDueToTimeLimit(code);
+      }, remainingMs);
+      this.maxDurationTimers.set(code, endTimer);
+    }
+
+    // Schedule 5-minute warning timer (at 1h 55m) if not yet scheduled
+    const warningTriggerMs = this.MAX_SESSION_DURATION_MS - this.WARNING_BEFORE_END_MS;
+    const warningDelayMs = warningTriggerMs - elapsedMs;
+
+    if (warningDelayMs <= 0) {
+      if (!this.warningIssuedClassrooms.has(code)) {
+        this.issueTimeLimitWarning(code, Math.max(1, Math.round(remainingMs / 1000)));
+      }
+    } else if (!this.warningTimers.has(code)) {
+      const warnTimer = setTimeout(() => {
+        this.issueTimeLimitWarning(code, 300);
+      }, warningDelayMs);
+      this.warningTimers.set(code, warnTimer);
+    }
+  }
+
+  issueTimeLimitWarning(code: string, remainingSeconds = 300) {
+    this.warningIssuedClassrooms.add(code);
+    this.logger.warn(`Classroom [${code}] has ${remainingSeconds}s remaining before 2-hour limit.`);
+    this.broadcastToClassroom(code, 'classroom:time-limit-warning', {
+      classroomCode: code,
+      remainingSeconds,
+      message: 'Classroom exceeding time limit, Please create another after it ended.',
+    });
+  }
+
+  async autoEndClassroomDueToTimeLimit(code: string) {
+    this.clearAllClassroomTimers(code);
+    const classroom = await this.classroomModel.findOne({
+      code: code.toUpperCase().trim(),
+    });
+
+    if (!classroom || classroom.status === ClassroomStatus.ENDED) {
+      return;
+    }
+
+    const now = new Date();
+    classroom.status = ClassroomStatus.ENDED;
+    classroom.endedAt = now;
+    classroom.endedReason = ClassroomEndedReason.TIME_LIMIT_EXCEEDED;
+    await classroom.save();
+
+    await this.finalizeParticipants(classroom._id, now);
+
+    this.logger.log(`Classroom [${code}] automatically ended: 2-hour time limit exceeded.`);
+
+    this.broadcastToClassroom(classroom.code, 'classroom:ended', {
+      classroomCode: classroom.code,
+      endedAt: classroom.endedAt,
+      reason: ClassroomEndedReason.TIME_LIMIT_EXCEEDED,
+      message: 'Classroom exceeding time limit, Please create another after it ended.',
+    });
+  }
+
+  async autoEndClassroomDueToInactivity(
+    code: string,
+    message = 'Classroom was automatically closed due to 5 minutes of inactivity or empty room.',
+  ) {
+    this.clearAllClassroomTimers(code);
     const classroom = await this.classroomModel.findOne({
       code: code.toUpperCase().trim(),
     });
@@ -232,9 +431,23 @@ export class ClassroomGateway
     classroom.endedReason = ClassroomEndedReason.INACTIVITY;
     await classroom.save();
 
-    // Finalize duration for active participants
+    await this.finalizeParticipants(classroom._id, now);
+
+    this.logger.log(
+      `Classroom [${code}] automatically ended due to 5 minutes of inactivity or 0 participants.`,
+    );
+
+    this.broadcastToClassroom(classroom.code, 'classroom:ended', {
+      classroomCode: classroom.code,
+      endedAt: classroom.endedAt,
+      reason: ClassroomEndedReason.INACTIVITY,
+      message,
+    });
+  }
+
+  private async finalizeParticipants(classroomId: Types.ObjectId, now: Date) {
     const rawParticipants = await this.participantModel.find({
-      classroomId: classroom._id,
+      classroomId,
       status: { $in: [ParticipantStatus.ACCEPTED, ParticipantStatus.LEFT] },
     });
     const participants = Array.isArray(rawParticipants) ? rawParticipants : [];
@@ -250,17 +463,6 @@ export class ClassroomGateway
         await p.save();
       }
     }
-
-    this.logger.log(
-      `Classroom [${code}] automatically ended due to inactivity (no participants connected).`,
-    );
-
-    this.broadcastToClassroom(classroom.code, 'classroom:ended', {
-      classroomCode: classroom.code,
-      endedAt: classroom.endedAt,
-      reason: ClassroomEndedReason.INACTIVITY,
-      message: 'Classroom was automatically closed due to inactivity',
-    });
   }
 
   private async handleUserExitedClassroom(code: string, user: AuthenticatedUser) {
@@ -288,12 +490,12 @@ export class ClassroomGateway
         }
       }
 
-      // If classroom is now completely empty, start inactivity timer!
+      // If classroom is now completely empty, start 5-minute inactivity timer!
       if (activeSet.size === 0) {
         this.logger.warn(
-          `All participants have exited classroom [${code}]. Scheduling auto-deletion/ending in 60s.`,
+          `All participants have exited classroom [${code}]. Scheduling auto-ending in 5 mins.`,
         );
-        this.scheduleInactivityTimer(code, 60000);
+        this.scheduleInactivityTimer(code, this.INACTIVITY_LIMIT_MS);
       }
     }
   }
@@ -411,11 +613,13 @@ export class ClassroomGateway
     @MessageBody() dto: any,
   ) {
     this.getAuthUser(client);
-    const code = client.data.classroomCode || dto?.classroomCode;
+    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
     if (!code) return { success: false };
 
     const tab = dto?.tab || dto?.activeTab;
     if (!tab) return { success: false };
+
+    this.recordActivity(code);
 
     // Broadcast to all other participants in the room
     client.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: tab, tab });
@@ -428,7 +632,12 @@ export class ClassroomGateway
     @MessageBody() dto: JoinRoomDto,
   ) {
     const user = this.getAuthUser(client);
-    const code = dto.classroomCode.toUpperCase().trim();
+    const rawCode = dto?.classroomCode || (dto as any)?.code || client.data.classroomCode || '';
+    const code = rawCode.toUpperCase().trim();
+
+    if (!code) {
+      throw new WsException('classroomCode is required');
+    }
 
     // Verify classroom exists & ACTIVE
     const classroom = await this.classroomModel.findOne({ code });
@@ -440,11 +649,29 @@ export class ClassroomGateway
     }
 
     // Verify participant is ACCEPTED
-    const participant = await this.participantModel.findOne({
+    let participant = await this.participantModel.findOne({
       classroomId: classroom._id,
       userId: new Types.ObjectId(user.id),
       status: ParticipantStatus.ACCEPTED,
     });
+
+    if (!participant) {
+      if (classroom.hostId.toString() === user.id) {
+        participant = await this.participantModel.findOneAndUpdate(
+          { classroomId: classroom._id, userId: new Types.ObjectId(user.id) },
+          {
+            classroomId: classroom._id,
+            userId: new Types.ObjectId(user.id),
+            role: ParticipantRole.HOST,
+            status: ParticipantStatus.ACCEPTED,
+            joinedAt: new Date(),
+          },
+          { upsert: true, new: true },
+        );
+      } else {
+        throw new WsException('Access denied: You are not an accepted participant of this classroom');
+      }
+    }
 
     if (!participant) {
       throw new WsException('Access denied: You are not an accepted participant of this classroom');
@@ -498,6 +725,24 @@ export class ClassroomGateway
     // Fetch whiteboard operations
     const whiteboardOps = await this.whiteboardService.getOperations(classroom._id.toString());
 
+    // Ensure 2-hour duration limit and 5-minute advance warning timers are running
+    this.ensureClassroomTimers(classroom);
+
+    // Record activity to reset 5-minute inactivity timer
+    this.recordActivity(code);
+
+    // Compute remaining time in 2-hour window
+    const createdAtMs = new Date(classroom.createdAt).getTime();
+    const elapsedMs = Math.max(0, Date.now() - createdAtMs);
+    const remainingMs = Math.max(0, this.MAX_SESSION_DURATION_MS - elapsedMs);
+    const timeLimit = {
+      maxDurationSeconds: Math.round(this.MAX_SESSION_DURATION_MS / 1000), // 7200
+      elapsedSeconds: Math.round(elapsedMs / 1000),
+      remainingSeconds: Math.round(remainingMs / 1000),
+      isWarning: remainingMs <= this.WARNING_BEFORE_END_MS,
+      warningMessage: 'Classroom exceeding time limit, Please create another after it ended.',
+    };
+
     // Send complete classroom state to the joining participant
     const statePayload = {
       classroom: {
@@ -510,6 +755,7 @@ export class ClassroomGateway
       participants: formattedParticipants,
       activePdf: classroom.activePdf || null,
       whiteboard: whiteboardOps,
+      timeLimit,
     };
 
     client.emit('classroom:state', statePayload);
@@ -557,28 +803,53 @@ export class ClassroomGateway
   @SubscribeMessage('whiteboard:draw')
   async handleWhiteboardDraw(
     @ConnectedSocket() client: Socket,
-    @MessageBody() dto: WhiteboardDrawDto,
+    @MessageBody() dto: any,
   ) {
     const user = this.getAuthUser(client);
-    const code = client.data.classroomCode;
-    const classroomId = client.data.classroomId;
+    let code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    let classroomId = client.data.classroomId;
+
+    if (!classroomId && code) {
+      const room = await this.classroomModel.findOne({ code });
+      if (room) {
+        classroomId = room._id.toString();
+        client.data.classroomId = classroomId;
+        client.data.classroomCode = code;
+      }
+    }
 
     if (!code || !classroomId) {
       throw new WsException('You must join a classroom first before drawing');
     }
 
+    this.recordActivity(code);
+
+    // Extract coordinates from either flat payload or nested { data: { ... } }
+    const payload = dto?.data || dto;
+    const x1 = payload?.x1;
+    const y1 = payload?.y1;
+    const x2 = payload?.x2;
+    const y2 = payload?.y2;
+    const color = payload?.color || '#000000';
+    const width = Number(payload?.width) || 3;
+
+    if (x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined) {
+      this.logger.warn(`whiteboard:draw ignored: missing coordinates in ${JSON.stringify(dto)}`);
+      return { success: false, message: 'Invalid coordinates' };
+    }
+
     const op = await this.whiteboardService.saveOperation(classroomId, user.id, {
       type: WhiteboardOperationType.DRAW,
-      x1: dto.x1,
-      y1: dto.y1,
-      x2: dto.x2,
-      y2: dto.y2,
-      color: dto.color || '#000000',
-      width: dto.width,
+      x1,
+      y1,
+      x2,
+      y2,
+      color,
+      width,
     });
 
-    // Broadcast to everyone in the room
-    this.server.to(`classroom:${code}`).emit('whiteboard:draw', {
+    // Broadcast to all participants in the room
+    const broadcastPayload = {
       id: op._id.toString(),
       userId: user.id,
       type: op.type,
@@ -589,34 +860,66 @@ export class ClassroomGateway
       color: op.color,
       width: op.width,
       createdAt: op.createdAt,
-    });
+      data: {
+        x1: op.x1,
+        y1: op.y1,
+        x2: op.x2,
+        y2: op.y2,
+        color: op.color,
+        width: op.width,
+      },
+    };
 
-    return { success: true };
+    client.to(`classroom:${code}`).emit('whiteboard:draw', broadcastPayload);
+
+    return { success: true, operation: broadcastPayload };
   }
 
   @SubscribeMessage('whiteboard:erase')
   async handleWhiteboardErase(
     @ConnectedSocket() client: Socket,
-    @MessageBody() dto: WhiteboardEraseDto,
+    @MessageBody() dto: any,
   ) {
     const user = this.getAuthUser(client);
-    const code = client.data.classroomCode;
-    const classroomId = client.data.classroomId;
+    let code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    let classroomId = client.data.classroomId;
+
+    if (!classroomId && code) {
+      const room = await this.classroomModel.findOne({ code });
+      if (room) {
+        classroomId = room._id.toString();
+        client.data.classroomId = classroomId;
+        client.data.classroomCode = code;
+      }
+    }
 
     if (!code || !classroomId) {
       throw new WsException('You must join a classroom first before erasing');
     }
 
+    this.recordActivity(code);
+
+    const payload = dto?.data || dto;
+    const x1 = payload?.x1;
+    const y1 = payload?.y1;
+    const x2 = payload?.x2;
+    const y2 = payload?.y2;
+    const width = Number(payload?.width) || 10;
+
+    if (x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined) {
+      return { success: false, message: 'Invalid coordinates' };
+    }
+
     const op = await this.whiteboardService.saveOperation(classroomId, user.id, {
       type: WhiteboardOperationType.ERASE,
-      x1: dto.x1,
-      y1: dto.y1,
-      x2: dto.x2,
-      y2: dto.y2,
-      width: dto.width,
+      x1,
+      y1,
+      x2,
+      y2,
+      width,
     });
 
-    this.server.to(`classroom:${code}`).emit('whiteboard:erase', {
+    const broadcastPayload = {
       id: op._id.toString(),
       userId: user.id,
       type: op.type,
@@ -626,25 +929,43 @@ export class ClassroomGateway
       y2: op.y2,
       width: op.width,
       createdAt: op.createdAt,
-    });
+      data: {
+        x1: op.x1,
+        y1: op.y1,
+        x2: op.x2,
+        y2: op.y2,
+        width: op.width,
+      },
+    };
+
+    client.to(`classroom:${code}`).emit('whiteboard:erase', broadcastPayload);
 
     return { success: true };
   }
 
   @SubscribeMessage('whiteboard:clear')
-  async handleWhiteboardClear(@ConnectedSocket() client: Socket) {
+  async handleWhiteboardClear(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() dto: any,
+  ) {
     const user = this.getAuthUser(client);
-    const code = client.data.classroomCode;
-    const classroomId = client.data.classroomId;
-    const role = client.data.role;
+    let code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    let classroomId = client.data.classroomId;
+
+    if (!classroomId && code) {
+      const room = await this.classroomModel.findOne({ code });
+      if (room) {
+        classroomId = room._id.toString();
+        client.data.classroomId = classroomId;
+        client.data.classroomCode = code;
+      }
+    }
 
     if (!code || !classroomId) {
       throw new WsException('You must join a classroom first');
     }
 
-    if (role !== ParticipantRole.HOST) {
-      throw new WsException('Forbidden: Only the host can clear the whiteboard');
-    }
+    this.recordActivity(code);
 
     await this.whiteboardService.clearOperations(classroomId);
 
@@ -653,17 +974,34 @@ export class ClassroomGateway
       timestamp: new Date().toISOString(),
     });
 
-    this.logger.log(`Whiteboard cleared for classroom ${code} by host ${user.email}`);
+    this.logger.log(`Whiteboard cleared for classroom ${code} by ${user.email}`);
     return { success: true };
   }
 
   @SubscribeMessage('whiteboard:state')
-  async handleWhiteboardState(@ConnectedSocket() client: Socket) {
+  async handleWhiteboardState(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() dto: any,
+  ) {
     this.getAuthUser(client);
-    const classroomId = client.data.classroomId;
+    let code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    let classroomId = client.data.classroomId;
+
+    if (!classroomId && code) {
+      const room = await this.classroomModel.findOne({ code });
+      if (room) {
+        classroomId = room._id.toString();
+        client.data.classroomId = classroomId;
+        client.data.classroomCode = code;
+      }
+    }
 
     if (!classroomId) {
       throw new WsException('You must join a classroom first');
+    }
+
+    if (code) {
+      this.recordActivity(code);
     }
 
     const operations = await this.whiteboardService.getOperations(classroomId);
@@ -714,6 +1052,7 @@ export class ClassroomGateway
     const activePdf = await this.pdfService.sharePdf(classroomId, dto);
 
     this.logger.log(`PDF shared in classroom ${code} by ${user.email}: ${dto.fileName}. Broadcasting to classroom:${code}`);
+    this.recordActivity(code);
     this.server.to(`classroom:${code}`).emit('pdf:shared', activePdf);
     return { success: true, activePdf };
   }
@@ -748,6 +1087,8 @@ export class ClassroomGateway
     client.data.classroomCode = code;
     client.data.classroomId = classroomId;
     client.data.role = ParticipantRole.HOST;
+
+    this.recordActivity(code);
 
     const page = typeof dto?.page === 'number' ? dto.page : dto?.currentPage || 1;
     const activePdf = await this.pdfService.changePage(classroomId, page);
@@ -786,6 +1127,8 @@ export class ClassroomGateway
       throw new WsException('Forbidden: Only the host can close the PDF');
     }
 
+    this.recordActivity(code);
+
     await this.pdfService.closePdf(classroomId);
 
     this.server.to(`classroom:${code}`).emit('pdf:closed', {
@@ -804,6 +1147,7 @@ export class ClassroomGateway
     const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
     if (!code) return { success: false };
 
+    this.recordActivity(code);
     client.to(`classroom:${code}`).emit('pdf:annotate', dto);
     return { success: true };
   }
@@ -817,6 +1161,7 @@ export class ClassroomGateway
     const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
     if (!code) return { success: false };
 
+    this.recordActivity(code);
     client.to(`classroom:${code}`).emit('pdf:erase', dto);
     return { success: true };
   }
@@ -830,6 +1175,7 @@ export class ClassroomGateway
     const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
     if (!code) return { success: false };
 
+    this.recordActivity(code);
     client.to(`classroom:${code}`).emit('pdf:clear-annotations', dto);
     return { success: true };
   }
@@ -846,6 +1192,9 @@ export class ClassroomGateway
     const user = this.getAuthUser(client);
     const targetUserId = dto.targetUserId;
     if (!targetUserId) return { success: false };
+
+    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    if (code) this.recordActivity(code);
 
     const offer = dto.offer || dto.data;
 
@@ -868,6 +1217,9 @@ export class ClassroomGateway
     const targetUserId = dto.targetUserId;
     if (!targetUserId) return { success: false };
 
+    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    if (code) this.recordActivity(code);
+
     const answer = dto.answer || dto.data;
 
     this.emitToUser(targetUserId, 'webrtc:answer', {
@@ -888,6 +1240,9 @@ export class ClassroomGateway
     const user = this.getAuthUser(client);
     const targetUserId = dto.targetUserId;
     if (!targetUserId) return { success: false };
+
+    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    if (code) this.recordActivity(code);
 
     const candidate = dto.candidate || dto.data;
 
@@ -911,6 +1266,8 @@ export class ClassroomGateway
     const rawCode = client.data.classroomCode || dto?.classroomCode;
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
+
+    this.recordActivity(code);
 
     client.to(`classroom:${code}`).emit('screenshare:started', {
       classroomCode: code,
@@ -941,6 +1298,8 @@ export class ClassroomGateway
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
 
+    this.recordActivity(code);
+
     const classroom = await this.classroomModel.findOne({ code });
     if (!classroom) return { success: false };
 
@@ -960,6 +1319,8 @@ export class ClassroomGateway
     const rawCode = client.data.classroomCode || dto?.classroomCode;
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
+
+    this.recordActivity(code);
 
     client.to(`classroom:${code}`).emit('screenshare:stopped', { classroomCode: code });
     client.to(`classroom:${code}`).emit('webrtc:screen-stopped', { classroomCode: code });
@@ -987,6 +1348,8 @@ export class ClassroomGateway
     const rawCode = client.data.classroomCode || dto?.classroomCode;
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
+
+    this.recordActivity(code);
 
     if (!this.voiceChatActivePeers.has(code)) {
       this.voiceChatActivePeers.set(code, new Map());
@@ -1055,6 +1418,8 @@ export class ClassroomGateway
   ) {
     const user = this.getAuthUser(client);
     if (!dto?.targetUserId || !dto?.offer) return { success: false };
+    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    if (code) this.recordActivity(code);
     this.emitToUser(dto.targetUserId, 'voicechat:offer', {
       fromUserId: user.id,
       fromUserName: user.name,
@@ -1070,6 +1435,8 @@ export class ClassroomGateway
   ) {
     const user = this.getAuthUser(client);
     if (!dto?.targetUserId || !dto?.answer) return { success: false };
+    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    if (code) this.recordActivity(code);
     this.emitToUser(dto.targetUserId, 'voicechat:answer', {
       fromUserId: user.id,
       answer: dto.answer,
@@ -1084,6 +1451,8 @@ export class ClassroomGateway
   ) {
     const user = this.getAuthUser(client);
     if (!dto?.targetUserId || !dto?.candidate) return { success: false };
+    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    if (code) this.recordActivity(code);
     this.emitToUser(dto.targetUserId, 'voicechat:ice-candidate', {
       fromUserId: user.id,
       candidate: dto.candidate,
@@ -1097,8 +1466,9 @@ export class ClassroomGateway
     @MessageBody() dto: any,
   ) {
     const user = this.getAuthUser(client);
-    const code = client.data.classroomCode || dto?.classroomCode;
+    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
     if (!code) return { success: false };
+    this.recordActivity(code);
     client.to(`classroom:${code}`).emit('voicechat:mute-state', {
       userId: user.id,
       audioMuted: dto?.audioMuted ?? false,

@@ -440,6 +440,9 @@ export class ClassroomsService {
 
     this.logger.log(`Classroom [${code}] ended by host ${user.email}`);
 
+    // Cancel all scheduled timers for this classroom
+    this.classroomGateway.clearAllClassroomTimers(classroom.code);
+
     // Broadcast classroom:ended
     this.classroomGateway.broadcastToClassroom(classroom.code, 'classroom:ended', {
       classroomCode: classroom.code,
@@ -475,6 +478,9 @@ export class ClassroomsService {
 
     // Finalize duration for all participants who were in the class
     await this.finalizeActiveParticipantsDuration(classroom._id, now);
+
+    // Cancel all scheduled timers for this classroom
+    this.classroomGateway.clearAllClassroomTimers(classroom.code);
 
     this.logger.log(
       `Classroom [${code}] automatically ended due to inactivity (no participants connected).`,
@@ -713,6 +719,264 @@ export class ClassroomsService {
         totalClassDurationFormatted: formatDuration(totalClassDurationSeconds),
         totalParticipantsCount: formattedParticipants.length,
         participants: formattedParticipants,
+      },
+    };
+  }
+
+  /**
+   * 14. GET RECENT CLASSROOMS (Teacher & Student)
+   * Returns recent classrooms created or joined by the user with their up-to-date status (ACTIVE or ENDED).
+   */
+  async getRecentClassrooms(userId: string) {
+    const userObjectId = new Types.ObjectId(userId);
+
+    // 1. Classrooms hosted by the user
+    const hostedRooms = await this.classroomModel
+      .find({ hostId: userObjectId })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .exec();
+
+    // 2. Classrooms joined by the user as a participant
+    const participantRecords = await this.participantModel
+      .find({
+        userId: userObjectId,
+        status: { $in: [ParticipantStatus.ACCEPTED, ParticipantStatus.LEFT] },
+      })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .exec();
+
+    const participantClassroomIds = participantRecords.map((p) => p.classroomId);
+
+    const joinedRooms = await this.classroomModel
+      .find({ _id: { $in: participantClassroomIds } })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .exec();
+
+    // Merge uniquely by classroom code, newest first
+    const roomMap = new Map<string, any>();
+
+    for (const room of [...hostedRooms, ...joinedRooms]) {
+      if (!roomMap.has(room.code)) {
+        roomMap.set(room.code, {
+          id: room._id.toString(),
+          name: room.name,
+          code: room.code,
+          status: room.status,
+          hostId: room.hostId.toString(),
+          createdAt: room.createdAt,
+          endedAt: room.endedAt || null,
+          endedReason: room.endedReason || null,
+        });
+      }
+    }
+
+    const classrooms = Array.from(roomMap.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    );
+
+    return {
+      success: true,
+      classrooms,
+      data: classrooms,
+    };
+  }
+
+  /**
+   * 15. GET CLASSROOM ANALYTICS
+   * Aggregates teaching & learning metrics for dashboard display.
+   * STRICT ROLE-BASED ISOLATION:
+   * - Teachers only view their own hosted classrooms, teaching hours, and student counts for their classes.
+   * - Students only view their own attended classrooms, learning hours, and attendance logs.
+   * - Cross-role and cross-user data is strictly omitted.
+   */
+  async getAnalytics(userId: string) {
+    const userObjectId = Types.ObjectId.isValid(userId) ? new Types.ObjectId(userId) : null;
+    const user = userObjectId ? await this.usersService.findById(userId) : null;
+    const userRole = String((user as any)?.role || 'STUDENT').toUpperCase().trim();
+
+    // 1. Hosted classrooms (strictly isolated to classrooms where hostId === userId)
+    const hostedClassrooms = userObjectId
+      ? await this.classroomModel
+          .find({ hostId: userObjectId })
+          .sort({ createdAt: -1 })
+          .exec()
+      : [];
+
+    const hasHostedRooms = hostedClassrooms.length > 0;
+    const isTeacher = userRole === 'TEACHER' || userRole === 'HOST' || hasHostedRooms;
+
+    if (user && hasHostedRooms && (user as any).role !== 'TEACHER') {
+      try {
+        (user as any).role = 'TEACHER';
+        await (user as any).save();
+      } catch {}
+    }
+
+    if (isTeacher) {
+      let totalTeachingDurationSeconds = 0;
+      const hostedSessionStats: Array<{
+        id: string;
+        name: string;
+        code: string;
+        status: string;
+        createdAt: Date;
+        endedAt: Date | null;
+        endedReason: string | null;
+        durationSeconds: number;
+        durationFormatted: string;
+        participantsCount: number;
+      }> = [];
+
+      for (const c of hostedClassrooms) {
+        let durationSecs = 0;
+        if (c.endedAt) {
+          durationSecs = Math.max(0, Math.round((c.endedAt.getTime() - c.createdAt.getTime()) / 1000));
+        } else if (c.status === ClassroomStatus.ACTIVE) {
+          durationSecs = Math.max(0, Math.round((Date.now() - c.createdAt.getTime()) / 1000));
+        }
+        totalTeachingDurationSeconds += durationSecs;
+
+        const participantCount = await this.participantModel.countDocuments({
+          classroomId: c._id,
+          role: ParticipantRole.STUDENT,
+          status: { $in: [ParticipantStatus.ACCEPTED, ParticipantStatus.LEFT] },
+        });
+
+        hostedSessionStats.push({
+          id: c._id.toString(),
+          name: c.name,
+          code: c.code,
+          status: c.status,
+          createdAt: c.createdAt,
+          endedAt: c.endedAt || null,
+          endedReason: c.endedReason || null,
+          durationSeconds: durationSecs,
+          durationFormatted: formatDuration(durationSecs),
+          participantsCount: participantCount,
+        });
+      }
+
+      const allHostedParticipants =
+        hostedClassrooms.length > 0
+          ? await this.participantModel.find({
+              classroomId: { $in: hostedClassrooms.map((c) => c._id) },
+              role: ParticipantRole.STUDENT,
+              status: { $in: [ParticipantStatus.ACCEPTED, ParticipantStatus.LEFT] },
+            })
+          : [];
+
+      const totalStudentsJoined = allHostedParticipants.length;
+      const uniqueStudentsSet = new Set(allHostedParticipants.map((p) => p.userId.toString()));
+      const uniqueStudentsCount = uniqueStudentsSet.size;
+
+      const teacherSummary = {
+        totalClassroomsHosted: hostedClassrooms.length,
+        activeClassroomsCount: hostedClassrooms.filter((c) => c.status === ClassroomStatus.ACTIVE).length,
+        endedClassroomsCount: hostedClassrooms.filter((c) => c.status === ClassroomStatus.ENDED).length,
+        totalTeachingDurationSeconds,
+        totalTeachingDurationFormatted: formatDuration(totalTeachingDurationSeconds),
+        avgDurationSeconds:
+          hostedClassrooms.length > 0
+            ? Math.round(totalTeachingDurationSeconds / hostedClassrooms.length)
+            : 0,
+        avgDurationFormatted: formatDuration(
+          hostedClassrooms.length > 0
+            ? Math.round(totalTeachingDurationSeconds / hostedClassrooms.length)
+            : 0,
+        ),
+        totalStudentsTaught: totalStudentsJoined,
+        uniqueStudentsCount,
+        avgStudentsPerClass:
+          hostedClassrooms.length > 0 ? +(totalStudentsJoined / hostedClassrooms.length).toFixed(1) : 0,
+      };
+
+      return {
+        success: true,
+        data: {
+          role: 'TEACHER',
+          teacherSummary,
+          studentSummary: null,
+          recentHostedSessions: hostedSessionStats.slice(0, 10),
+          recentAttendedSessions: [],
+        },
+      };
+    }
+
+    // 2. Attended classrooms (strictly isolated to participant records where userId === userId)
+    const attendedRecords = userObjectId
+      ? await this.participantModel
+          .find({
+            userId: userObjectId,
+            role: ParticipantRole.STUDENT,
+            status: { $in: [ParticipantStatus.ACCEPTED, ParticipantStatus.LEFT] },
+          })
+          .sort({ createdAt: -1 })
+          .exec()
+      : [];
+
+    let totalLearningDurationSeconds = 0;
+    const attendedSessions: Array<{
+      id: string;
+      name: string;
+      code: string;
+      status: string;
+      hostName: string;
+      createdAt: Date;
+      joinedAt: Date | null;
+      leftAt: Date | null;
+      myDurationSeconds: number;
+      myDurationFormatted: string;
+    }> = [];
+    const uniqueHostsSet = new Set<string>();
+
+    for (const r of attendedRecords) {
+      totalLearningDurationSeconds += r.durationSeconds || 0;
+      const room = await this.classroomModel.findById(r.classroomId);
+      if (room) {
+        uniqueHostsSet.add(room.hostId.toString());
+        const hostUser = await this.usersService.findById(room.hostId.toString());
+        attendedSessions.push({
+          id: room._id.toString(),
+          name: room.name,
+          code: room.code,
+          status: room.status,
+          hostName: hostUser?.name || 'Instructor',
+          createdAt: room.createdAt,
+          joinedAt: r.joinedAt || null,
+          leftAt: r.leftAt || null,
+          myDurationSeconds: r.durationSeconds || 0,
+          myDurationFormatted: formatDuration(r.durationSeconds || 0),
+        });
+      }
+    }
+
+    const studentSummary = {
+      totalClassesAttended: attendedRecords.length,
+      totalLearningDurationSeconds,
+      totalLearningDurationFormatted: formatDuration(totalLearningDurationSeconds),
+      avgAttendanceDurationSeconds:
+        attendedRecords.length > 0
+          ? Math.round(totalLearningDurationSeconds / attendedRecords.length)
+          : 0,
+      avgAttendanceDurationFormatted: formatDuration(
+        attendedRecords.length > 0
+          ? Math.round(totalLearningDurationSeconds / attendedRecords.length)
+          : 0,
+      ),
+      uniqueInstructorsCount: uniqueHostsSet.size,
+    };
+
+    return {
+      success: true,
+      data: {
+        role: 'STUDENT',
+        teacherSummary: null,
+        studentSummary,
+        recentHostedSessions: [],
+        recentAttendedSessions: attendedSessions.slice(0, 10),
       },
     };
   }

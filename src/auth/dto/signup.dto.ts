@@ -52,4 +52,9 @@ export class SignupDto {
   @IsOptional()
   @IsString()
   role?: string;
+
+  @ApiProperty({ example: '+919876543210', required: false, description: 'User phone number for SMS OTP verification' })
+  @IsOptional()
+  @IsString()
+  phone?: string;
 }

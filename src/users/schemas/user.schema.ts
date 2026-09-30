@@ -8,6 +8,8 @@ export type UserDocument = HydratedDocument<User>;
   toJSON: {
     transform: (_doc, ret: Record<string, any>) => {
       delete ret.passwordHash;
+      delete ret.emailVerificationToken;
+      delete ret.emailVerificationOtp;
       delete ret.__v;
       return ret;
     },
@@ -27,11 +29,29 @@ export class User extends Document {
   @Prop({ required: true })
   passwordHash: string;
 
-  @Prop({ default: null })
+  @Prop({ default: 'STUDENT' })
   role?: string;
 
   @Prop({ default: null })
   avatar?: string;
+
+  @Prop({ default: null, trim: true })
+  phone?: string;
+
+  @Prop({ default: false })
+  isEmailVerified: boolean;
+
+  @Prop({ default: false })
+  isPhoneVerified?: boolean;
+
+  @Prop({ default: null, index: true })
+  emailVerificationToken?: string;
+
+  @Prop({ default: null })
+  emailVerificationOtp?: string;
+
+  @Prop({ default: null })
+  emailVerificationExpires?: Date;
 
   createdAt: Date;
   updatedAt: Date;

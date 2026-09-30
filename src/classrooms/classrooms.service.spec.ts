@@ -40,7 +40,11 @@ describe('ClassroomsService', () => {
     }
     MockClassroom.findOne = vi.fn();
     MockClassroom.findById = vi.fn();
-    MockClassroom.find = vi.fn();
+    MockClassroom.find = vi.fn().mockReturnValue({
+      sort: vi.fn().mockReturnValue({
+        exec: vi.fn().mockResolvedValue([]),
+      }),
+    });
     mockClassroomModel = MockClassroom as any;
 
     function MockParticipant(data: any) {
@@ -73,6 +77,7 @@ describe('ClassroomsService', () => {
       notifyStudentRejected: vi.fn(),
       broadcastToClassroom: vi.fn(),
       scheduleInitialInactivityTimer: vi.fn(),
+      clearAllClassroomTimers: vi.fn(),
     };
 
     service = new ClassroomsService(
@@ -408,6 +413,103 @@ describe('ClassroomsService', () => {
       expect(result.data[0].code).toBe('TDP8K2');
       expect(result.data[0].myAttendance.durationSeconds).toBe(1800);
       expect(result.data[0].myAttendance.durationFormatted).toBe('30m');
+    });
+  });
+
+  describe('getAnalytics', () => {
+    it('should return teacher metrics only for instructor, isolating hosted rooms', async () => {
+      mockUsersService.findById.mockResolvedValue({
+        _id: hostUser.id,
+        name: hostUser.name,
+        email: hostUser.email,
+        role: 'TEACHER',
+      });
+
+      const createdAt = new Date(Date.now() - 3600000);
+      const endedAt = new Date();
+      const classroomId = new Types.ObjectId();
+
+      mockClassroomModel.find.mockReturnValue({
+        sort: vi.fn().mockReturnValue({
+          exec: vi.fn().mockResolvedValue([
+            {
+              _id: classroomId,
+              name: 'Advanced React',
+              code: 'REACT1',
+              status: ClassroomStatus.ENDED,
+              createdAt,
+              endedAt,
+              endedReason: 'HOST_ENDED',
+            },
+          ]),
+        }),
+      });
+
+      mockParticipantModel.countDocuments.mockResolvedValue(5);
+      mockParticipantModel.find.mockResolvedValue([
+        { userId: new Types.ObjectId(studentUser.id), role: ParticipantRole.STUDENT },
+      ]);
+
+      const result = await service.getAnalytics(hostUser.id);
+      expect(result.success).toBe(true);
+      expect(result.data.role).toBe('TEACHER');
+      expect(result.data.teacherSummary).toBeDefined();
+      expect(result.data.teacherSummary.totalClassroomsHosted).toBe(1);
+      expect(result.data.teacherSummary.endedClassroomsCount).toBe(1);
+      expect(result.data.recentHostedSessions).toHaveLength(1);
+      expect(result.data.recentHostedSessions[0].code).toBe('REACT1');
+      // Must not expose student analytics
+      expect(result.data.studentSummary).toBeNull();
+      expect(result.data.recentAttendedSessions).toEqual([]);
+    });
+
+    it('should return student metrics only for student, isolating attended rooms', async () => {
+      mockUsersService.findById.mockResolvedValue({
+        _id: studentUser.id,
+        name: studentUser.name,
+        email: studentUser.email,
+        role: 'STUDENT',
+      });
+
+      const classroomId = new Types.ObjectId();
+      const createdAt = new Date(Date.now() - 1800000);
+
+      mockParticipantModel.find.mockReturnValue({
+        sort: vi.fn().mockReturnValue({
+          exec: vi.fn().mockResolvedValue([
+            {
+              classroomId,
+              userId: new Types.ObjectId(studentUser.id),
+              role: ParticipantRole.STUDENT,
+              status: ParticipantStatus.ACCEPTED,
+              joinedAt: createdAt,
+              leftAt: new Date(),
+              durationSeconds: 1800,
+            },
+          ]),
+        }),
+      });
+
+      mockClassroomModel.findById.mockResolvedValue({
+        _id: classroomId,
+        name: 'Math 101',
+        code: 'MATH01',
+        hostId: new Types.ObjectId(hostUser.id),
+        status: ClassroomStatus.ACTIVE,
+        createdAt,
+      });
+
+      const result = await service.getAnalytics(studentUser.id);
+      expect(result.success).toBe(true);
+      expect(result.data.role).toBe('STUDENT');
+      expect(result.data.studentSummary).toBeDefined();
+      expect(result.data.studentSummary.totalClassesAttended).toBe(1);
+      expect(result.data.studentSummary.totalLearningDurationSeconds).toBe(1800);
+      expect(result.data.recentAttendedSessions).toHaveLength(1);
+      expect(result.data.recentAttendedSessions[0].code).toBe('MATH01');
+      // Must not expose teacher analytics
+      expect(result.data.teacherSummary).toBeNull();
+      expect(result.data.recentHostedSessions).toEqual([]);
     });
   });
 });
