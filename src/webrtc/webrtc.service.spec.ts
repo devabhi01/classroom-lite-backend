@@ -1,27 +1,27 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ForbiddenException } from '@nestjs/common';
-import { Types } from 'mongoose';
+import { ParticipantStatus } from '@prisma/client';
 import { WebrtcService } from './webrtc.service.js';
-import { ParticipantStatus } from '../common/constants/statuses.enum.js';
 
 describe('WebrtcService', () => {
   let service: WebrtcService;
-  let mockParticipantModel: any;
+  let mockPrisma: any;
 
   beforeEach(() => {
-    mockParticipantModel = {
-      findOne: vi.fn(),
+    mockPrisma = {
+      classroomParticipant: {
+        findUnique: vi.fn(),
+      },
     };
-    service = new WebrtcService(mockParticipantModel);
+    service = new WebrtcService(mockPrisma);
   });
 
   it('should validate successfully when both sender and target are accepted participants', async () => {
-    const classroomId = new Types.ObjectId().toString();
-    const senderUserId = new Types.ObjectId().toString();
-    const targetUserId = new Types.ObjectId().toString();
+    const classroomId = 'classroom-uuid-1';
+    const senderUserId = 'sender-uuid-1';
+    const targetUserId = 'target-uuid-2';
 
-    // First call for sender, second call for target
-    mockParticipantModel.findOne
+    mockPrisma.classroomParticipant.findUnique
       .mockResolvedValueOnce({ userId: senderUserId, status: ParticipantStatus.ACCEPTED })
       .mockResolvedValueOnce({ userId: targetUserId, status: ParticipantStatus.ACCEPTED });
 
@@ -30,8 +30,8 @@ describe('WebrtcService', () => {
   });
 
   it('should reject when sender and target are the same user', async () => {
-    const classroomId = new Types.ObjectId().toString();
-    const userId = new Types.ObjectId().toString();
+    const classroomId = 'classroom-uuid-1';
+    const userId = 'user-uuid-1';
 
     await expect(service.validateSignalingPeers(classroomId, userId, userId)).rejects.toThrow(
       ForbiddenException,
@@ -39,11 +39,11 @@ describe('WebrtcService', () => {
   });
 
   it('should return false if target user is not in the classroom', async () => {
-    const classroomId = new Types.ObjectId().toString();
-    const senderUserId = new Types.ObjectId().toString();
-    const targetUserId = new Types.ObjectId().toString();
+    const classroomId = 'classroom-uuid-1';
+    const senderUserId = 'sender-uuid-1';
+    const targetUserId = 'target-uuid-2';
 
-    mockParticipantModel.findOne
+    mockPrisma.classroomParticipant.findUnique
       .mockResolvedValueOnce({ userId: senderUserId, status: ParticipantStatus.ACCEPTED })
       .mockResolvedValueOnce(null);
 

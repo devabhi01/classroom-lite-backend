@@ -1,4 +1,4 @@
-import { Controller, Get, UseGuards } from '@nestjs/common';
+import { Controller, Get, Delete, UseGuards, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { UsersService } from './users.service.js';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard.js';
@@ -28,5 +28,21 @@ export class UsersController {
       success: true,
       data: this.usersService.sanitizeUser(fullUser || user),
     };
+  }
+
+  @Delete('me')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Permanently delete currently authenticated user account' })
+  @ApiResponse({
+    status: 200,
+    description: 'User account deleted successfully',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Cannot delete account while owning institutions',
+  })
+  async deleteAccount(@CurrentUser() user: AuthenticatedUser) {
+    return this.usersService.deleteAccount(user.id);
   }
 }

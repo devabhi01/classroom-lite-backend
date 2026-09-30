@@ -41,6 +41,20 @@ export class ClassroomsController {
     return this.classroomsService.createClassroom(dto, user);
   }
 
+  @Get()
+  @ApiOperation({ summary: 'Get current user recent classrooms with real-time active status' })
+  @ApiResponse({ status: 200, description: 'List of recent classrooms returned' })
+  async getRecent(@CurrentUser() user: AuthenticatedUser) {
+    return this.classroomsService.getRecentClassrooms(user);
+  }
+
+  @Get('recent')
+  @ApiOperation({ summary: 'Get current user recent classrooms (alias)' })
+  @ApiResponse({ status: 200, description: 'List of recent classrooms returned' })
+  async getRecentAlias(@CurrentUser() user: AuthenticatedUser) {
+    return this.classroomsService.getRecentClassrooms(user);
+  }
+
   // ==========================================
   // DASHBOARD HISTORY ENDPOINTS
   // Defined before /:code to avoid route collision

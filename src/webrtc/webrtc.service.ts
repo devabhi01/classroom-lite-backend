@@ -1,17 +1,12 @@
 import { Injectable, Logger, ForbiddenException } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
-import { Participant, ParticipantDocument } from '../classrooms/schemas/participant.schema.js';
-import { ParticipantStatus } from '../common/constants/statuses.enum.js';
+import { ParticipantStatus } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service.js';
 
 @Injectable()
 export class WebrtcService {
   private readonly logger = new Logger(WebrtcService.name);
 
-  constructor(
-    @InjectModel(Participant.name)
-    private readonly participantModel: Model<ParticipantDocument>,
-  ) {}
+  constructor(private readonly prisma: PrismaService) {}
 
   async validateSignalingPeers(
     classroomId: string,
@@ -22,28 +17,32 @@ export class WebrtcService {
       throw new ForbiddenException('Sender and target cannot be the same user');
     }
 
-    const cId = new Types.ObjectId(classroomId);
-
     // Verify sender is accepted participant
-    const sender = await this.participantModel.findOne({
-      classroomId: cId,
-      userId: new Types.ObjectId(senderUserId),
-      status: ParticipantStatus.ACCEPTED,
+    const sender = await this.prisma.classroomParticipant.findUnique({
+      where: {
+        classroomId_userId: {
+          classroomId,
+          userId: senderUserId,
+        },
+      },
     });
 
-    if (!sender) {
+    if (!sender || sender.status !== ParticipantStatus.ACCEPTED) {
       this.logger.warn(`Sender ${senderUserId} is not an accepted participant in classroom ${classroomId}`);
       return false;
     }
 
     // Verify target is accepted participant in the same classroom
-    const target = await this.participantModel.findOne({
-      classroomId: cId,
-      userId: new Types.ObjectId(targetUserId),
-      status: ParticipantStatus.ACCEPTED,
+    const target = await this.prisma.classroomParticipant.findUnique({
+      where: {
+        classroomId_userId: {
+          classroomId,
+          userId: targetUserId,
+        },
+      },
     });
 
-    if (!target) {
+    if (!target || target.status !== ParticipantStatus.ACCEPTED) {
       this.logger.warn(`Target ${targetUserId} is not an accepted participant in classroom ${classroomId}`);
       return false;
     }

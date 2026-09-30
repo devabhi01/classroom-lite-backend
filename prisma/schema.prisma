@@ -1,0 +1,193 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  STUDENT
+  TEACHER
+}
+
+enum InstitutionRole {
+  OWNER
+  ADMIN
+  TEACHER
+  STUDENT
+}
+
+enum MembershipStatus {
+  REQUESTED
+  ACCEPTED
+  REJECTED
+  LEFT
+}
+
+enum InstitutionStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum ClassroomType {
+  INDEPENDENT
+  INSTITUTION
+}
+
+enum ClassroomStatus {
+  ACTIVE
+  ENDED
+}
+
+enum ParticipantRole {
+  HOST
+  STUDENT
+}
+
+enum ParticipantStatus {
+  REQUESTED
+  ACCEPTED
+  REJECTED
+  LEFT
+}
+
+enum WhiteboardOperationType {
+  DRAW
+  ERASE
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  avatar       String?
+  role         UserRole @default(STUDENT)
+  isEmailVerified         Boolean   @default(false) @map("is_email_verified")
+  emailVerificationOtp    String?   @map("email_verification_otp")
+  emailVerificationExpires DateTime? @map("email_verification_expires")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  ownedInstitutions      Institution[]           @relation("InstitutionOwner")
+  institutionMemberships InstitutionMembership[]
+  hostedClassrooms       Classroom[]             @relation("ClassroomHost")
+  classroomParticipants  ClassroomParticipant[]
+  whiteboardOperations   WhiteboardOperation[]
+
+  @@map("users")
+}
+
+model Institution {
+  id          String            @id @default(uuid()) @db.Uuid
+  name        String
+  code        String            @unique
+  description String?
+  logo        String?
+  email       String?
+  phone       String?
+  address     String?
+  website     String?
+  ownerId     String            @map("owner_id") @db.Uuid
+  owner       User              @relation("InstitutionOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+  status      InstitutionStatus @default(ACTIVE)
+  createdAt   DateTime          @default(now()) @map("created_at")
+  updatedAt   DateTime          @updatedAt @map("updated_at")
+
+  // Relations
+  memberships InstitutionMembership[]
+  classrooms  Classroom[]
+
+  @@index([name])
+  @@index([code])
+  @@map("institutions")
+}
+
+model InstitutionMembership {
+  id            String           @id @default(uuid()) @db.Uuid
+  institutionId String           @map("institution_id") @db.Uuid
+  institution   Institution      @relation(fields: [institutionId], references: [id], onDelete: Cascade)
+  userId        String           @map("user_id") @db.Uuid
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role          InstitutionRole
+  status        MembershipStatus @default(REQUESTED)
+  requestedAt   DateTime         @default(now()) @map("requested_at")
+  acceptedAt    DateTime?        @map("accepted_at")
+  createdAt     DateTime         @default(now()) @map("created_at")
+  updatedAt     DateTime         @updatedAt @map("updated_at")
+
+  @@unique([institutionId, userId])
+  @@index([institutionId, status])
+  @@index([userId, status])
+  @@map("institution_memberships")
+}
+
+model Classroom {
+  id                   String          @id @default(uuid()) @db.Uuid
+  name                 String
+  code                 String          @unique
+  hostId               String          @map("host_id") @db.Uuid
+  host                 User            @relation("ClassroomHost", fields: [hostId], references: [id], onDelete: Restrict)
+  institutionId        String?         @map("institution_id") @db.Uuid
+  institution          Institution?    @relation(fields: [institutionId], references: [id], onDelete: SetNull)
+  type                 ClassroomType   @default(INDEPENDENT)
+  status               ClassroomStatus @default(ACTIVE)
+  activePdfFileName    String?         @map("active_pdf_file_name")
+  activePdfFileUrl     String?         @map("active_pdf_file_url")
+  activePdfTotalPages  Int?            @map("active_pdf_total_pages")
+  activePdfCurrentPage Int?            @map("active_pdf_current_page")
+  createdAt            DateTime        @default(now()) @map("created_at")
+  updatedAt            DateTime        @updatedAt @map("updated_at")
+  endedAt              DateTime?       @map("ended_at")
+
+  // Relations
+  participants         ClassroomParticipant[]
+  whiteboardOperations WhiteboardOperation[]
+
+  @@index([code])
+  @@index([hostId])
+  @@index([institutionId])
+  @@map("classrooms")
+}
+
+model ClassroomParticipant {
+  id              String            @id @default(uuid()) @db.Uuid
+  classroomId     String            @map("classroom_id") @db.Uuid
+  classroom       Classroom         @relation(fields: [classroomId], references: [id], onDelete: Cascade)
+  userId          String            @map("user_id") @db.Uuid
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role            ParticipantRole   @default(STUDENT)
+  status          ParticipantStatus @default(REQUESTED)
+  joinedAt        DateTime?         @map("joined_at")
+  leftAt          DateTime?         @map("left_at")
+  durationSeconds Int?              @map("duration_seconds")
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+
+  @@unique([classroomId, userId])
+  @@index([classroomId, status])
+  @@index([userId, status])
+  @@map("classroom_participants")
+}
+
+model WhiteboardOperation {
+  id          String                  @id @default(uuid()) @db.Uuid
+  classroomId String                  @map("classroom_id") @db.Uuid
+  classroom   Classroom               @relation(fields: [classroomId], references: [id], onDelete: Cascade)
+  userId      String                  @map("user_id") @db.Uuid
+  user        User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type        WhiteboardOperationType
+  x1          Float
+  y1          Float
+  x2          Float
+  y2          Float
+  color       String?
+  width       Float
+  createdAt   DateTime                @default(now()) @map("created_at")
+
+  @@index([classroomId, createdAt])
+  @@map("whiteboard_operations")
+}
