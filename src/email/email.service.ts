@@ -10,47 +10,66 @@ export class EmailService {
   private readonly fromAddress: string;
 
   constructor(private readonly configService: ConfigService) {
-    const user =
+    const rawUser =
       this.configService.get<string>('SMTP_USER') ||
       this.configService.get<string>('GMAIL_USER') ||
+      this.configService.get<string>('smtpUser') ||
       process.env.SMTP_USER ||
-      process.env.GMAIL_USER;
+      process.env.GMAIL_USER ||
+      '';
 
-    const pass =
+    const rawPass =
       this.configService.get<string>('SMTP_PASS') ||
       this.configService.get<string>('GMAIL_APP_PASSWORD') ||
+      this.configService.get<string>('smtpPass') ||
       process.env.SMTP_PASS ||
-      process.env.GMAIL_APP_PASSWORD;
+      process.env.GMAIL_APP_PASSWORD ||
+      '';
+
+    const user = rawUser.trim();
+    // Google App Passwords often copied with spaces like "abcd efgh ijkl mnop" -> strip them
+    const pass = rawPass.trim().replace(/\s+/g, '');
 
     const host =
       this.configService.get<string>('SMTP_HOST') ||
+      this.configService.get<string>('smtpHost') ||
       process.env.SMTP_HOST ||
       'smtp.gmail.com';
 
     const port = Number(
       this.configService.get<number>('SMTP_PORT') ||
+        this.configService.get<number>('smtpPort') ||
         process.env.SMTP_PORT ||
         587,
     );
 
     this.fromAddress =
       this.configService.get<string>('EMAIL_FROM') ||
+      this.configService.get<string>('emailFrom') ||
       process.env.EMAIL_FROM ||
       `"TDP Classroom Lite" <${user || 'noreply@tdpclassroom.com'}>`;
 
     if (user && pass) {
-      this.transporter = nodemailer.createTransport({
-        host,
-        port,
-        secure: port === 465,
-        auth: { user, pass },
-      });
+      if (host.includes('gmail') || user.endsWith('@gmail.com')) {
+        this.transporter = nodemailer.createTransport({
+          service: 'gmail',
+          auth: { user, pass },
+        });
+        this.logger.log(`EmailService: Gmail SMTP transport initialized for ${user}`);
+      } else {
+        this.transporter = nodemailer.createTransport({
+          host,
+          port,
+          secure: port === 465,
+          auth: { user, pass },
+        });
+        this.logger.log(`EmailService: Custom SMTP transport initialized with ${host}:${port} (${user})`);
+      }
       this.isConfigured = true;
-      this.logger.log(`EmailService initialized with SMTP host: ${host}:${port} (${user})`);
     } else {
       this.isConfigured = false;
       this.logger.warn(
-        'EmailService: No SMTP credentials found (SMTP_USER / GMAIL_USER and SMTP_PASS / GMAIL_APP_PASSWORD). Emails will be logged to the console.',
+        'EmailService: No SMTP credentials configured (GMAIL_USER and GMAIL_APP_PASSWORD not set). Real emails will NOT be sent; OTP codes will be printed to server console.',
       );
     }
   }
@@ -111,6 +130,9 @@ export class EmailService {
     this.logger.log(`\n==================================================\n📧 [EMAIL VERIFICATION OTP]\nTo: ${to} (${name})\nOTP Code: [ ${otp} ] (Valid for 15 mins)\n==================================================`);
 
     if (!this.isConfigured || !this.transporter) {
+      this.logger.warn(
+        `Email not delivered via SMTP: GMAIL_USER / GMAIL_APP_PASSWORD not set in environment variables. Use the OTP code [ ${otp} ] above to verify.`,
+      );
       return true;
     }
 

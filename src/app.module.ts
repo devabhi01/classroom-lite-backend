@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule } from '@nestjs/throttler';
 
 import { configuration } from './config/configuration.js';
+import { AppController } from './app.controller.js';
 import { PrismaModule } from './prisma/prisma.module.js';
 import { HealthModule } from './health/health.module.js';
 import { UsersModule } from './users/users.module.js';
@@ -48,5 +49,6 @@ import { EmailModule } from './email/email.module.js';
     PdfModule,
     WebrtcModule,
   ],
+  controllers: [AppController],
 })
 export class AppModule {}
