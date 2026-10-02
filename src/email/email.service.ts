@@ -50,21 +50,23 @@ export class EmailService {
       `"TDP Classroom Lite" <${user || 'noreply@tdpclassroom.com'}>`;
 
     if (user && pass) {
-      if (host.includes('gmail') || user.endsWith('@gmail.com')) {
-        this.transporter = nodemailer.createTransport({
-          service: 'gmail',
-          auth: { user, pass },
-        });
-        this.logger.log(`EmailService: Gmail SMTP transport initialized for ${user}`);
-      } else {
-        this.transporter = nodemailer.createTransport({
-          host,
-          port,
-          secure: port === 465,
-          auth: { user, pass },
-        });
-        this.logger.log(`EmailService: Custom SMTP transport initialized with ${host}:${port} (${user})`);
-      }
+      const isGmail = host.includes('gmail') || user.endsWith('@gmail.com');
+      const transportOptions: any = {
+        host: isGmail ? 'smtp.gmail.com' : host,
+        port: isGmail ? 465 : port,
+        secure: isGmail ? true : port === 465,
+        auth: { user, pass },
+        family: 4, // Crucial for Render / cloud containers: force IPv4 to avoid IPv6 hang
+        connectionTimeout: 8000,
+        greetingTimeout: 5000,
+        socketTimeout: 10000,
+        dnsTimeout: 5000,
+      };
+
+      this.transporter = nodemailer.createTransport(transportOptions);
+      this.logger.log(
+        `EmailService: SMTP transport initialized for ${user} (Host: ${transportOptions.host}:${transportOptions.port}, IPv4 forced)`,
+      );
       this.isConfigured = true;
     } else {
       this.isConfigured = false;
@@ -137,16 +139,22 @@ export class EmailService {
     }
 
     try {
-      await this.transporter.sendMail({
+      const sendPromise = this.transporter.sendMail({
         from: this.fromAddress,
         to,
         subject,
         html,
       });
+
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('SMTP connection timed out after 8s')), 8000),
+      );
+
+      await Promise.race([sendPromise, timeoutPromise]);
       this.logger.log(`Verification email sent successfully to ${to}`);
       return true;
     } catch (err: any) {
-      this.logger.error(`Failed to send email to ${to}: ${err.message}`);
+      this.logger.error(`Failed to send email to ${to}: ${err.message}. OTP code [ ${otp} ] remains valid.`);
       return false;
     }
   }
