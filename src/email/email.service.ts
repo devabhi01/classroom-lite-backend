@@ -43,10 +43,18 @@ export class EmailService {
         587,
     );
 
-    this.fromAddress =
+    const rawFrom = (
       this.configService.get<string>('EMAIL_FROM') ||
       this.configService.get<string>('emailFrom') ||
       process.env.EMAIL_FROM ||
+      ''
+    ).trim();
+
+    // Strip accidental outer single or double quotes added in Render dashboard
+    const cleanedFrom = rawFrom.replace(/^['"]|['"]$/g, '').trim();
+
+    this.fromAddress =
+      cleanedFrom ||
       `"TDP Classroom Lite" <${user || 'noreply@tdpclassroom.com'}>`;
 
     if (user && pass) {
