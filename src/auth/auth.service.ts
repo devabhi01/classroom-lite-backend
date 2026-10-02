@@ -6,30 +6,40 @@ import {
   Logger,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import crypto from 'crypto';
 import bcrypt from 'bcrypt';
+import {
+  UserRole,
+  InstitutionRole,
+  MembershipStatus,
+  InstitutionStatus,
+} from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service.js';
 import { UsersService } from '../users/users.service.js';
-import { MailService } from '../mail/mail.service.js';
-import { SmsService } from '../sms/sms.service.js';
+import { EmailService } from '../email/email.service.js';
 import { SignupDto } from './dto/signup.dto.js';
 import { LoginDto } from './dto/login.dto.js';
 import { VerifyEmailDto } from './dto/verify-email.dto.js';
 import { ResendVerificationDto } from './dto/resend-verification.dto.js';
 import { JwtPayload } from '../common/interfaces/jwt-payload.interface.js';
+import { generateInstitutionCode } from '../common/utils/generate-institution-code.util.js';
 
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
   constructor(
+    private readonly prisma: PrismaService,
     private readonly usersService: UsersService,
     private readonly jwtService: JwtService,
-    private readonly mailService: MailService,
-    private readonly smsService: SmsService,
+    private readonly emailService: EmailService,
   ) {}
 
   async signup(signupDto: SignupDto) {
-    const existing = await this.usersService.findByEmail(signupDto.email);
+    const email = signupDto.email.toLowerCase().trim();
+    const existing = await this.prisma.user.findUnique({
+      where: { email },
+    });
+
     if (existing) {
       throw new ConflictException('Email address is already registered');
     }
@@ -37,148 +47,149 @@ export class AuthService {
     const saltRounds = 10;
     const passwordHash = await bcrypt.hash(signupDto.password, saltRounds);
 
-    const userRole = signupDto.role?.toUpperCase() === 'TEACHER' ? 'TEACHER' : 'STUDENT';
+    const userRole =
+      signupDto.role?.toUpperCase() === 'TEACHER' ? UserRole.TEACHER : UserRole.STUDENT;
 
-    // Generate verification token and 6-digit OTP code (24-hour expiration)
-    const emailVerificationToken = crypto.randomBytes(32).toString('hex');
-    const emailVerificationOtp = Math.floor(100000 + Math.random() * 900000).toString();
-    const emailVerificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    // Generate 6-digit verification code (expires in 15 minutes)
+    const verificationOtp = Math.floor(100000 + Math.random() * 900000).toString();
+    const verificationExpires = new Date(Date.now() + 15 * 60 * 1000);
 
-    const user = await this.usersService.create({
-      name: signupDto.name,
-      email: signupDto.email,
-      passwordHash,
-      avatar: signupDto.avatar,
-      role: userRole,
-      phone: signupDto.phone,
-      isEmailVerified: false,
-      isPhoneVerified: false,
-      emailVerificationToken,
-      emailVerificationOtp,
-      emailVerificationExpires,
+    // Execute User creation and optional Institution / Membership setups in a transaction
+    const user = await this.prisma.$transaction(async (tx) => {
+      const createdUser = await tx.user.create({
+        data: {
+          name: signupDto.name.trim(),
+          email,
+          passwordHash,
+          avatar: signupDto.avatar || null,
+          role: userRole,
+          isEmailVerified: false,
+          emailVerificationOtp: verificationOtp,
+          emailVerificationExpires: verificationExpires,
+        },
+      });
+
+      // --- TEACHER FLOW (Part 9, 10, 11) ---
+      if (userRole === UserRole.TEACHER) {
+        if (signupDto.institutionName && signupDto.institutionName.trim()) {
+          // Option 2: Teacher creates their own institution
+          let code = generateInstitutionCode();
+          let attempts = 0;
+          while (attempts < 5) {
+            const codeExists = await tx.institution.findUnique({ where: { code } });
+            if (!codeExists) break;
+            code = generateInstitutionCode();
+            attempts++;
+          }
+
+          const institution = await tx.institution.create({
+            data: {
+              name: signupDto.institutionName.trim(),
+              code,
+              ownerId: createdUser.id,
+              status: InstitutionStatus.ACTIVE,
+            },
+          });
+
+          await tx.institutionMembership.create({
+            data: {
+              institutionId: institution.id,
+              userId: createdUser.id,
+              role: InstitutionRole.OWNER,
+              status: MembershipStatus.ACCEPTED,
+              acceptedAt: new Date(),
+            },
+          });
+
+          this.logger.log(
+            `Teacher ${email} created institution ${institution.name} [${code}] during signup`,
+          );
+        } else if (signupDto.institutionId || signupDto.institutionCode) {
+          // Option 1: Teacher requests to join existing institution
+          let targetInst = null;
+          if (signupDto.institutionId) {
+            targetInst = await tx.institution.findUnique({
+              where: { id: signupDto.institutionId },
+            });
+          } else if (signupDto.institutionCode) {
+            targetInst = await tx.institution.findUnique({
+              where: { code: signupDto.institutionCode.trim().toUpperCase() },
+            });
+          }
+
+          if (targetInst && targetInst.status === InstitutionStatus.ACTIVE) {
+            await tx.institutionMembership.create({
+              data: {
+                institutionId: targetInst.id,
+                userId: createdUser.id,
+                role: InstitutionRole.TEACHER,
+                status: MembershipStatus.REQUESTED,
+              },
+            });
+            this.logger.log(
+              `Teacher ${email} submitted join request to institution ${targetInst.name} during signup`,
+            );
+          }
+        }
+      }
+
+      // --- STUDENT FLOW (Part 12, 13) ---
+      if (userRole === UserRole.STUDENT && signupDto.institutionIds && signupDto.institutionIds.length > 0) {
+        for (const instId of signupDto.institutionIds) {
+          if (!instId || typeof instId !== 'string') continue;
+          const inst = await tx.institution.findUnique({ where: { id: instId } });
+          if (inst && inst.status === InstitutionStatus.ACTIVE) {
+            await tx.institutionMembership.create({
+              data: {
+                institutionId: inst.id,
+                userId: createdUser.id,
+                role: InstitutionRole.STUDENT,
+                status: MembershipStatus.REQUESTED,
+              },
+            });
+            this.logger.log(
+              `Student ${email} submitted join request to institution ${inst.name} during signup`,
+            );
+          }
+        }
+      }
+
+      return createdUser;
     });
 
-    // Send confirmation email
-    await this.mailService.sendVerificationEmail(
+    // Send verification email with 6-digit OTP
+    await this.emailService.sendVerificationOtp(
       user.email,
       user.name,
-      emailVerificationToken,
-      emailVerificationOtp,
+      user.emailVerificationOtp || verificationOtp,
     );
 
-    // Send SMS OTP if phone number is provided
-    if (signupDto.phone) {
-      await this.smsService.sendOtp(
-        signupDto.phone,
-        emailVerificationOtp,
-        user.name,
-      );
-    }
-
-    this.logger.log(`User signed up (verification pending): ${user.email}`);
-
-    return {
-      success: true,
-      message: signupDto.phone
-        ? 'Account created! Confirmation OTP sent to your email and phone.'
-        : 'Account created! Please check your email to verify your account.',
-      data: {
-        requiresVerification: true,
-        email: user.email,
-        phone: user.phone || undefined,
-        user: this.usersService.sanitizeUser(user),
-      },
-    };
-  }
-
-  async verifyEmail(verifyEmailDto: VerifyEmailDto) {
-    let user = null;
-
-    if (verifyEmailDto.token) {
-      user = await this.usersService.findByVerificationToken(verifyEmailDto.token.trim());
-    } else if (verifyEmailDto.code && (verifyEmailDto.email || verifyEmailDto.phone)) {
-      const identifier = (verifyEmailDto.email || verifyEmailDto.phone)!.trim();
-      user = await this.usersService.findByVerificationOtp(
-        identifier,
-        verifyEmailDto.code.trim(),
-      );
-    } else {
-      throw new BadRequestException('Please provide a verification token or 6-digit code with email or phone.');
-    }
-
-    if (!user) {
-      throw new BadRequestException('Invalid or expired verification code/link. Please request a new one.');
-    }
-
-    const verifiedUser = await this.usersService.markEmailAsVerified(user._id.toString());
     const payload: JwtPayload = {
-      sub: user._id.toString(),
+      sub: user.id,
       email: user.email,
     };
     const accessToken = this.jwtService.sign(payload);
 
-    this.logger.log(`Verification confirmed successfully for: ${user.email}`);
+    this.logger.log(`User signed up successfully: ${user.email} (${user.role}) [Unverified]`);
 
     return {
       success: true,
-      message: 'Account verified successfully! Welcome to TDP Classroom Lite.',
+      message: 'Account created! Please enter the 6-digit verification code sent to your email.',
+      requiresVerification: true,
       data: {
-        user: this.usersService.sanitizeUser(verifiedUser || user),
+        user: this.usersService.sanitizeUser(user),
         accessToken,
+        requiresVerification: true,
       },
     };
   }
 
-  async resendVerification(resendDto: ResendVerificationDto) {
-    let user = null;
-    if (resendDto.email) {
-      user = await this.usersService.findByEmail(resendDto.email);
-    } else if (resendDto.phone) {
-      user = await this.usersService.findByPhone(resendDto.phone);
-    }
-
-    if (!user) {
-      // Return success to avoid email/phone enumeration
-      return {
-        success: true,
-        message: 'If an account exists with this credential, a verification OTP has been sent.',
-      };
-    }
-
-    if (user.isEmailVerified && user.isPhoneVerified) {
-      return {
-        success: true,
-        message: 'Your account is already verified. You can log in directly.',
-      };
-    }
-
-    const token = crypto.randomBytes(32).toString('hex');
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expires = new Date(Date.now() + 24 * 60 * 60 * 1000);
-
-    await this.usersService.setVerificationData(user._id.toString(), {
-      token,
-      otp,
-      expires,
+  async login(loginDto: LoginDto) {
+    const email = loginDto.email.toLowerCase().trim();
+    const user = await this.prisma.user.findUnique({
+      where: { email },
     });
 
-    if (user.email) {
-      await this.mailService.sendVerificationEmail(user.email, user.name, token, otp);
-    }
-    if (user.phone) {
-      await this.smsService.sendOtp(user.phone, otp, user.name);
-    }
-
-    return {
-      success: true,
-      message: user.phone
-        ? 'Verification code resent to your email and phone!'
-        : 'Verification code resent to your email!',
-    };
-  }
-
-  async login(loginDto: LoginDto) {
-    const user = await this.usersService.findByEmail(loginDto.email);
     if (!user) {
       throw new UnauthorizedException('Invalid email or password');
     }
@@ -188,18 +199,32 @@ export class AuthService {
       throw new UnauthorizedException('Invalid email or password');
     }
 
-    // Require email/phone verification (explicit false check preserves legacy test data)
-    if (user.isEmailVerified === false) {
+    // Check if email is verified
+    if (!user.isEmailVerified) {
+      // Generate a fresh OTP and resend
+      const otp = Math.floor(100000 + Math.random() * 900000).toString();
+      const expires = new Date(Date.now() + 15 * 60 * 1000);
+
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          emailVerificationOtp: otp,
+          emailVerificationExpires: expires,
+        },
+      });
+
+      await this.emailService.sendVerificationOtp(user.email, user.name, otp);
+
       throw new UnauthorizedException({
-        message: 'Please verify your email/phone before logging in. We sent an OTP to your inbox and phone.',
+        statusCode: 401,
+        message: 'Your email address is not verified. A new 6-digit verification code has been sent to your email.',
         requiresVerification: true,
         email: user.email,
-        phone: user.phone || undefined,
       });
     }
 
     const payload: JwtPayload = {
-      sub: user._id.toString(),
+      sub: user.id,
       email: user.email,
     };
     const accessToken = this.jwtService.sign(payload);
@@ -212,6 +237,97 @@ export class AuthService {
         user: this.usersService.sanitizeUser(user),
         accessToken,
       },
+    };
+  }
+
+  async verifyEmail(dto: VerifyEmailDto) {
+    const email = dto.email.toLowerCase().trim();
+    const user = await this.prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (!user) {
+      throw new BadRequestException('User not found with this email address');
+    }
+
+    if (user.isEmailVerified) {
+      const payload: JwtPayload = { sub: user.id, email: user.email };
+      const accessToken = this.jwtService.sign(payload);
+      return {
+        success: true,
+        message: 'Email is already verified',
+        data: {
+          user: this.usersService.sanitizeUser(user),
+          accessToken,
+        },
+      };
+    }
+
+    if (!user.emailVerificationOtp || user.emailVerificationOtp !== dto.otp.trim()) {
+      throw new BadRequestException('Invalid 6-digit verification code');
+    }
+
+    if (user.emailVerificationExpires && user.emailVerificationExpires < new Date()) {
+      throw new BadRequestException('Verification code has expired. Please request a new code.');
+    }
+
+    const updatedUser = await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        isEmailVerified: true,
+        emailVerificationOtp: null,
+        emailVerificationExpires: null,
+      },
+    });
+
+    const payload: JwtPayload = {
+      sub: updatedUser.id,
+      email: updatedUser.email,
+    };
+    const accessToken = this.jwtService.sign(payload);
+
+    this.logger.log(`Email verified successfully for: ${updatedUser.email}`);
+
+    return {
+      success: true,
+      message: 'Email verified successfully! Welcome to TDP Classroom Lite.',
+      data: {
+        user: this.usersService.sanitizeUser(updatedUser),
+        accessToken,
+      },
+    };
+  }
+
+  async resendVerification(dto: ResendVerificationDto) {
+    const email = dto.email.toLowerCase().trim();
+    const user = await this.prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (!user) {
+      throw new BadRequestException('User not found with this email address');
+    }
+
+    if (user.isEmailVerified) {
+      throw new BadRequestException('Email address is already verified. You can sign in directly.');
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expires = new Date(Date.now() + 15 * 60 * 1000);
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        emailVerificationOtp: otp,
+        emailVerificationExpires: expires,
+      },
+    });
+
+    await this.emailService.sendVerificationOtp(user.email, user.name, otp);
+
+    return {
+      success: true,
+      message: 'A fresh 6-digit verification code has been sent to your email.',
     };
   }
 

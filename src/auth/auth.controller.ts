@@ -33,34 +33,6 @@ export class AuthController {
     return this.authService.signup(signupDto);
   }
 
-  @Post('verify-email')
-  @HttpCode(HttpStatus.OK)
-  @Throttle({ default: { limit: 15, ttl: 60000 } })
-  @ApiOperation({ summary: 'Verify email address via token or 6-digit OTP code' })
-  @ApiResponse({
-    status: 200,
-    description: 'Email verified successfully and JWT token issued',
-  })
-  @ApiResponse({
-    status: 400,
-    description: 'Bad Request - Invalid or expired token/code',
-  })
-  async verifyEmail(@Body() verifyEmailDto: VerifyEmailDto) {
-    return this.authService.verifyEmail(verifyEmailDto);
-  }
-
-  @Post('resend-verification')
-  @HttpCode(HttpStatus.OK)
-  @Throttle({ default: { limit: 5, ttl: 60000 } })
-  @ApiOperation({ summary: 'Resend email verification code/link' })
-  @ApiResponse({
-    status: 200,
-    description: 'Verification email resent successfully',
-  })
-  async resendVerification(@Body() resendDto: ResendVerificationDto) {
-    return this.authService.resendVerification(resendDto);
-  }
-
   @Post('login')
   @HttpCode(HttpStatus.OK)
   @Throttle({ default: { limit: 10, ttl: 60000 } })
@@ -71,7 +43,7 @@ export class AuthController {
   })
   @ApiResponse({
     status: 401,
-    description: 'Unauthorized - Invalid credentials or unverified email',
+    description: 'Unauthorized - Invalid credentials or email not verified',
   })
   @ApiResponse({
     status: 400,
@@ -79,5 +51,37 @@ export class AuthController {
   })
   async login(@Body() loginDto: LoginDto) {
     return this.authService.login(loginDto);
+  }
+
+  @Post('verify-email')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 15, ttl: 60000 } })
+  @ApiOperation({ summary: 'Verify email address with 6-digit OTP code' })
+  @ApiResponse({
+    status: 200,
+    description: 'Email verified successfully and user logged in',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad Request - Invalid or expired verification code',
+  })
+  async verifyEmail(@Body() dto: VerifyEmailDto) {
+    return this.authService.verifyEmail(dto);
+  }
+
+  @Post('resend-verification')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @ApiOperation({ summary: 'Resend 6-digit verification OTP to user email' })
+  @ApiResponse({
+    status: 200,
+    description: 'Fresh verification code dispatched to email',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad Request - Email already verified or user not found',
+  })
+  async resendVerification(@Body() dto: ResendVerificationDto) {
+    return this.authService.resendVerification(dto);
   }
 }

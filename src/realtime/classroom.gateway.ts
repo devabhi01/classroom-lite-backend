@@ -11,26 +11,21 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { Logger, UsePipes, ValidationPipe } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import {
+  ClassroomStatus,
+  ParticipantStatus,
+  ParticipantRole,
+  WhiteboardOperationType,
+} from '@prisma/client';
 
+import { PrismaService } from '../prisma/prisma.service.js';
 import { UsersService } from '../users/users.service.js';
-import { Classroom, ClassroomDocument } from '../classrooms/schemas/classroom.schema.js';
-import { Participant, ParticipantDocument } from '../classrooms/schemas/participant.schema.js';
 import { WhiteboardService } from '../whiteboard/whiteboard.service.js';
 import { PdfService } from '../pdf/pdf.service.js';
 import { WebrtcService } from '../webrtc/webrtc.service.js';
 import { formatDuration } from '../common/utils/format-duration.util.js';
-import { parseAllowedOrigins, isOriginAllowed } from '../common/utils/cors.util.js';
-import {
-  ClassroomStatus,
-  ClassroomEndedReason,
-  ParticipantStatus,
-  WhiteboardOperationType,
-} from '../common/constants/statuses.enum.js';
-import { ParticipantRole } from '../common/constants/roles.enum.js';
 import type { AuthenticatedUser } from '../common/interfaces/authenticated-user.interface.js';
 import { JwtPayload } from '../common/interfaces/jwt-payload.interface.js';
 import { JoinRoomDto } from './dto/join-room.dto.js';
@@ -38,21 +33,12 @@ import { LeaveRoomDto } from './dto/leave-room.dto.js';
 import { WhiteboardDrawDto } from '../whiteboard/dto/whiteboard-draw.dto.js';
 import { WhiteboardEraseDto } from '../whiteboard/dto/whiteboard-erase.dto.js';
 import { SharePdfDto } from '../pdf/dto/share-pdf.dto.js';
-import { PageChangeDto } from '../pdf/dto/page-change.dto.js';
-import { WebrtcSignalDto } from '../webrtc/dto/webrtc-signal.dto.js';
 
 @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
 @WebSocketGateway({
   namespace: '/classroom',
   cors: {
-    origin: (origin: string, callback: (err: Error | null, allow?: boolean) => void) => {
-      const allowedOrigins = parseAllowedOrigins(process.env.FRONTEND_URL);
-      if (isOriginAllowed(origin, allowedOrigins)) {
-        callback(null, true);
-      } else {
-        callback(new Error(`WebSocket origin ${origin} not allowed by CORS`));
-      }
-    },
+    origin: true,
     credentials: true,
   },
 })
@@ -76,112 +62,101 @@ export class ClassroomGateway
   // Map: classroomCode -> Map<userId, { userName: string; hasVideo: boolean }>
   private readonly voiceChatActivePeers = new Map<string, Map<string, { userName: string; hasVideo: boolean }>>();
 
-  // Inactivity & Session Duration Rules:
-  // 1. Auto-end classroom if 0 active participants or no activity for 5 minutes
-  private readonly INACTIVITY_LIMIT_MS = 5 * 60 * 1000; // 5 minutes (300,000 ms)
-
-  // 2. Maximum session duration of 2 hours, with a warning 5 minutes before
-  private readonly MAX_SESSION_DURATION_MS = 2 * 60 * 60 * 1000; // 2 hours (7,200,000 ms)
-  private readonly WARNING_BEFORE_END_MS = 5 * 60 * 1000; // 5 minutes (300,000 ms)
-
-  // Map: classroomCode -> timestamp of last recorded activity
-  private readonly classroomLastActivity = new Map<string, number>();
-
-  // Map: classroomCode -> NodeJS.Timeout for 2-hour max duration
-  private readonly maxDurationTimers = new Map<string, NodeJS.Timeout>();
-
-  // Map: classroomCode -> NodeJS.Timeout for 5-minute warning before 2 hours
-  private readonly warningTimers = new Map<string, NodeJS.Timeout>();
-
-  // Set: classroomCodes where 5-min warning before 2 hours was already issued
-  private readonly warningIssuedClassrooms = new Set<string>();
-
   constructor(
+    private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly usersService: UsersService,
     private readonly whiteboardService: WhiteboardService,
     private readonly pdfService: PdfService,
     private readonly webrtcService: WebrtcService,
-    @InjectModel(Classroom.name)
-    private readonly classroomModel: Model<ClassroomDocument>,
-    @InjectModel(Participant.name)
-    private readonly participantModel: Model<ParticipantDocument>,
   ) {}
 
-  afterInit(server: Server) {
-    // Socket.IO authentication and origin middleware: runs BEFORE any event can be received!
-    server.use(async (socket: Socket, next: (err?: Error) => void) => {
-      try {
-        const origin = socket.handshake.headers?.origin;
-        const allowedOrigins = parseAllowedOrigins(
-          this.configService.get<string>('frontendUrl') || process.env.FRONTEND_URL,
-        );
-        if (origin && !isOriginAllowed(origin, allowedOrigins)) {
-          this.logger.warn(
-            `Socket rejected: Unauthorized origin '${origin}' (${socket.id})`,
-          );
-          return next(new Error(`Unauthorized origin: ${origin}`));
+  async afterInit() {
+    this.logger.log('ClassroomGateway initialized on namespace /classroom');
+    await this.reconcileStaleActiveClassrooms();
+  }
+
+  isClassroomActive(code: string): boolean {
+    const active = this.classroomActiveUsers.get(code.toUpperCase().trim());
+    return Boolean(active && active.size > 0);
+  }
+
+  getActiveParticipantCount(code: string): number {
+    return this.classroomActiveUsers.get(code.toUpperCase().trim())?.size || 0;
+  }
+
+  async reconcileStaleActiveClassrooms() {
+    try {
+      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+      const staleRooms = await this.prisma.classroom.findMany({
+        where: {
+          status: ClassroomStatus.ACTIVE,
+          createdAt: { lt: twoHoursAgo },
+        },
+      });
+
+      for (const room of staleRooms) {
+        if (!this.isClassroomActive(room.code)) {
+          await this.autoEndClassroomDueToInactivity(room.code);
         }
-
-        let token =
-          socket.handshake.auth?.token ||
-          socket.handshake.headers?.authorization;
-
-        if (!token) {
-          this.logger.warn(`Socket rejected: No token provided (${socket.id})`);
-          return next(new Error('Unauthorized: No token provided'));
-        }
-
-        if (token.startsWith('Bearer ')) {
-          token = token.slice(7).trim();
-        }
-
-        const secret =
-          this.configService.get<string>('jwtSecret') ||
-          this.configService.get<string>('JWT_SECRET') ||
-          'tdp-classroom-lite-jwt-secret-key-2025';
-
-        const payload = this.jwtService.verify<JwtPayload>(token, { secret });
-        const user = await this.usersService.findById(payload.sub);
-
-        if (!user) {
-          this.logger.warn(`Socket rejected: User ${payload.sub} not found`);
-          return next(new Error('Unauthorized: User not found'));
-        }
-
-        const authenticatedUser: AuthenticatedUser = {
-          id: user._id.toString(),
-          email: user.email,
-          name: user.name,
-          avatar: user.avatar,
-        };
-
-        socket.data.user = authenticatedUser;
-        next();
-      } catch (error: any) {
-        this.logger.warn(`Socket auth middleware error: ${error.message} (${socket.id})`);
-        next(new Error(`Unauthorized: ${error.message}`));
       }
-    });
-
-    this.logger.log('ClassroomGateway initialized on namespace /classroom with auth middleware');
+    } catch (err: any) {
+      this.logger.warn(`Could not reconcile stale classrooms on startup: ${err.message}`);
+    }
   }
 
   async handleConnection(client: Socket) {
-    const user = client.data.user as AuthenticatedUser | undefined;
-    if (!user) {
+    try {
+      let token =
+        client.handshake.auth?.token ||
+        client.handshake.headers?.authorization;
+
+      if (!token) {
+        this.logger.warn(`Socket connection rejected: No token provided (${client.id})`);
+        client.disconnect(true);
+        return;
+      }
+
+      if (token.startsWith('Bearer ')) {
+        token = token.slice(7).trim();
+      }
+
+      const secret =
+        this.configService.get<string>('jwtSecret') ||
+        this.configService.get<string>('JWT_SECRET') ||
+        'tdp-classroom-lite-jwt-secret-key-2025';
+
+      const payload = this.jwtService.verify<JwtPayload>(token, { secret });
+      const user = await this.usersService.findById(payload.sub);
+
+      if (!user) {
+        this.logger.warn(`Socket connection rejected: User ${payload.sub} not found`);
+        client.disconnect(true);
+        return;
+      }
+
+      const authenticatedUser: AuthenticatedUser = {
+        id: user.id || (user as any)._id?.toString(),
+        email: user.email,
+        name: user.name,
+        avatar: user.avatar || undefined,
+        role: user.role || undefined,
+      };
+
+      client.data.user = authenticatedUser;
+
+      // Track socket ID under user
+      if (!this.userSockets.has(authenticatedUser.id)) {
+        this.userSockets.set(authenticatedUser.id, new Set());
+      }
+      this.userSockets.get(authenticatedUser.id)!.add(client.id);
+
+      this.logger.log(`Socket connected: ${client.id} (User: ${user.name} - ${user.email})`);
+    } catch (error: any) {
+      this.logger.warn(`Socket authentication failed: ${error.message} (${client.id})`);
       client.disconnect(true);
-      return;
     }
-
-    // Track socket ID under user
-    if (!this.userSockets.has(user.id)) {
-      this.userSockets.set(user.id, new Set());
-    }
-    this.userSockets.get(user.id)!.add(client.id);
-
-    this.logger.log(`Socket connected: ${client.id} (User: ${user.name} - ${user.email})`);
   }
 
   async handleDisconnect(client: Socket) {
@@ -217,31 +192,7 @@ export class ClassroomGateway
 
   // Helper method: get authenticated user from socket
   private getAuthUser(client: Socket): AuthenticatedUser {
-    let user = client.data.user as AuthenticatedUser | undefined;
-    if (!user) {
-      // Fallback: synchronous parse from handshake token if possible
-      try {
-        let token = client.handshake.auth?.token || client.handshake.headers?.authorization;
-        if (token) {
-          if (token.startsWith('Bearer ')) token = token.slice(7).trim();
-          const secret =
-            this.configService.get<string>('jwtSecret') ||
-            this.configService.get<string>('JWT_SECRET') ||
-            'tdp-classroom-lite-jwt-secret-key-2025';
-          const payload = this.jwtService.verify<JwtPayload>(token, { secret });
-          if (payload?.sub) {
-            user = {
-              id: payload.sub,
-              email: payload.email || '',
-              name: (payload as any).name || 'User',
-              avatar: (payload as any).avatar || null,
-            };
-            client.data.user = user;
-          }
-        }
-      } catch {}
-    }
-
+    const user = client.data.user as AuthenticatedUser;
     if (!user) {
       throw new WsException('Unauthorized: No authenticated user session found');
     }
@@ -249,145 +200,48 @@ export class ClassroomGateway
   }
 
   // ==========================================
-  // INACTIVITY & SESSION DURATION TIMERS
+  // INACTIVITY TIMERS & TRACKING
   // ==========================================
-
-  /**
-   * Resets the 5-minute idle inactivity timer whenever ANY user activity occurs
-   */
-  recordActivity(classroomCode: string) {
-    if (!classroomCode) return;
-    const code = classroomCode.toUpperCase().trim();
-    this.classroomLastActivity.set(code, Date.now());
-    this.scheduleInactivityTimer(code, this.INACTIVITY_LIMIT_MS);
-  }
 
   scheduleInitialInactivityTimer(classroomCode: string, delayMs = 300000) {
     this.scheduleInactivityTimer(classroomCode, delayMs);
   }
 
-  scheduleInactivityTimer(classroomCode: string, delayMs = 300000) {
-    const code = classroomCode.toUpperCase().trim();
-    this.clearInactivityTimer(code);
+  scheduleInactivityTimer(classroomCode: string, delayMs = 60000) {
+    this.clearInactivityTimer(classroomCode);
 
     const timer = setTimeout(async () => {
       try {
-        const activeSet = this.classroomActiveUsers.get(code);
-        const lastActivity = this.classroomLastActivity.get(code) || 0;
-        const now = Date.now();
-        const isIdleFor5Mins = lastActivity > 0 && now - lastActivity >= this.INACTIVITY_LIMIT_MS;
-        const isEmpty = !activeSet || activeSet.size === 0;
-
-        if (isEmpty) {
+        const activeSet = this.classroomActiveUsers.get(classroomCode);
+        if (!activeSet || activeSet.size === 0) {
           this.logger.warn(
-            `Classroom [${code}] has had 0 active participants for 5 minutes. Auto-ending classroom.`,
+            `Classroom [${classroomCode}] has had 0 active participants for ${Math.round(
+              delayMs / 1000,
+            )}s. Auto-ending classroom.`,
           );
-          await this.autoEndClassroomDueToInactivity(
-            code,
-            'Classroom was automatically closed: no participants connected for 5 minutes.',
-          );
-        } else if (isIdleFor5Mins) {
-          this.logger.warn(
-            `Classroom [${code}] has been inactive for 5 minutes. Auto-ending classroom.`,
-          );
-          await this.autoEndClassroomDueToInactivity(
-            code,
-            'Classroom was automatically closed due to 5 minutes of inactivity.',
-          );
+          await this.autoEndClassroomDueToInactivity(classroomCode);
+          this.classroomActiveUsers.delete(classroomCode);
+          this.inactivityTimers.delete(classroomCode);
         }
       } catch (err: any) {
-        this.logger.error(`Error auto-ending classroom ${code}: ${err.message}`);
+        this.logger.error(`Error auto-ending classroom ${classroomCode}: ${err.message}`);
       }
     }, delayMs);
 
-    this.inactivityTimers.set(code, timer);
+    this.inactivityTimers.set(classroomCode, timer);
   }
 
   clearInactivityTimer(classroomCode: string) {
-    const code = classroomCode.toUpperCase().trim();
-    const timer = this.inactivityTimers.get(code);
+    const timer = this.inactivityTimers.get(classroomCode);
     if (timer) {
       clearTimeout(timer);
-      this.inactivityTimers.delete(code);
+      this.inactivityTimers.delete(classroomCode);
     }
   }
 
-  clearAllClassroomTimers(classroomCode: string) {
-    const code = classroomCode.toUpperCase().trim();
-    this.clearInactivityTimer(code);
-
-    const maxTimer = this.maxDurationTimers.get(code);
-    if (maxTimer) {
-      clearTimeout(maxTimer);
-      this.maxDurationTimers.delete(code);
-    }
-
-    const warnTimer = this.warningTimers.get(code);
-    if (warnTimer) {
-      clearTimeout(warnTimer);
-      this.warningTimers.delete(code);
-    }
-
-    this.warningIssuedClassrooms.delete(code);
-    this.classroomLastActivity.delete(code);
-  }
-
-  /**
-   * Enforces 2-hour maximum classroom session limit with 5-minute advance warning
-   */
-  ensureClassroomTimers(classroom: ClassroomDocument) {
-    const code = classroom.code.toUpperCase().trim();
-    if (classroom.status === ClassroomStatus.ENDED) return;
-
-    const createdAtMs = new Date(classroom.createdAt).getTime();
-    const nowMs = Date.now();
-    const elapsedMs = Math.max(0, nowMs - createdAtMs);
-    const remainingMs = this.MAX_SESSION_DURATION_MS - elapsedMs;
-
-    if (remainingMs <= 0) {
-      // Exceeded 2 hours already; terminate immediately
-      this.autoEndClassroomDueToTimeLimit(code);
-      return;
-    }
-
-    // Schedule 2-hour max duration timer if not yet scheduled
-    if (!this.maxDurationTimers.has(code)) {
-      const endTimer = setTimeout(() => {
-        this.autoEndClassroomDueToTimeLimit(code);
-      }, remainingMs);
-      this.maxDurationTimers.set(code, endTimer);
-    }
-
-    // Schedule 5-minute warning timer (at 1h 55m) if not yet scheduled
-    const warningTriggerMs = this.MAX_SESSION_DURATION_MS - this.WARNING_BEFORE_END_MS;
-    const warningDelayMs = warningTriggerMs - elapsedMs;
-
-    if (warningDelayMs <= 0) {
-      if (!this.warningIssuedClassrooms.has(code)) {
-        this.issueTimeLimitWarning(code, Math.max(1, Math.round(remainingMs / 1000)));
-      }
-    } else if (!this.warningTimers.has(code)) {
-      const warnTimer = setTimeout(() => {
-        this.issueTimeLimitWarning(code, 300);
-      }, warningDelayMs);
-      this.warningTimers.set(code, warnTimer);
-    }
-  }
-
-  issueTimeLimitWarning(code: string, remainingSeconds = 300) {
-    this.warningIssuedClassrooms.add(code);
-    this.logger.warn(`Classroom [${code}] has ${remainingSeconds}s remaining before 2-hour limit.`);
-    this.broadcastToClassroom(code, 'classroom:time-limit-warning', {
-      classroomCode: code,
-      remainingSeconds,
-      message: 'Classroom exceeding time limit, Please create another after it ended.',
-    });
-  }
-
-  async autoEndClassroomDueToTimeLimit(code: string) {
-    this.clearAllClassroomTimers(code);
-    const classroom = await this.classroomModel.findOne({
-      code: code.toUpperCase().trim(),
+  async autoEndClassroomDueToInactivity(code: string) {
+    const classroom = await this.prisma.classroom.findUnique({
+      where: { code: code.toUpperCase().trim() },
     });
 
     if (!classroom || classroom.status === ClassroomStatus.ENDED) {
@@ -395,74 +249,48 @@ export class ClassroomGateway
     }
 
     const now = new Date();
-    classroom.status = ClassroomStatus.ENDED;
-    classroom.endedAt = now;
-    classroom.endedReason = ClassroomEndedReason.TIME_LIMIT_EXCEEDED;
-    await classroom.save();
-
-    await this.finalizeParticipants(classroom._id, now);
-
-    this.logger.log(`Classroom [${code}] automatically ended: 2-hour time limit exceeded.`);
-
-    this.broadcastToClassroom(classroom.code, 'classroom:ended', {
-      classroomCode: classroom.code,
-      endedAt: classroom.endedAt,
-      reason: ClassroomEndedReason.TIME_LIMIT_EXCEEDED,
-      message: 'Classroom exceeding time limit, Please create another after it ended.',
-    });
-  }
-
-  async autoEndClassroomDueToInactivity(
-    code: string,
-    message = 'Classroom was automatically closed due to 5 minutes of inactivity or empty room.',
-  ) {
-    this.clearAllClassroomTimers(code);
-    const classroom = await this.classroomModel.findOne({
-      code: code.toUpperCase().trim(),
+    await this.prisma.classroom.update({
+      where: { id: classroom.id },
+      data: {
+        status: ClassroomStatus.ENDED,
+        endedAt: now,
+      },
     });
 
-    if (!classroom || classroom.status === ClassroomStatus.ENDED) {
-      return;
-    }
-
-    const now = new Date();
-    classroom.status = ClassroomStatus.ENDED;
-    classroom.endedAt = now;
-    classroom.endedReason = ClassroomEndedReason.INACTIVITY;
-    await classroom.save();
-
-    await this.finalizeParticipants(classroom._id, now);
-
-    this.logger.log(
-      `Classroom [${code}] automatically ended due to 5 minutes of inactivity or 0 participants.`,
-    );
-
-    this.broadcastToClassroom(classroom.code, 'classroom:ended', {
-      classroomCode: classroom.code,
-      endedAt: classroom.endedAt,
-      reason: ClassroomEndedReason.INACTIVITY,
-      message,
+    // Finalize duration for active participants
+    const participants = await this.prisma.classroomParticipant.findMany({
+      where: {
+        classroomId: classroom.id,
+        status: { in: [ParticipantStatus.ACCEPTED, ParticipantStatus.LEFT] },
+      },
     });
-  }
-
-  private async finalizeParticipants(classroomId: Types.ObjectId, now: Date) {
-    const rawParticipants = await this.participantModel.find({
-      classroomId,
-      status: { $in: [ParticipantStatus.ACCEPTED, ParticipantStatus.LEFT] },
-    });
-    const participants = Array.isArray(rawParticipants) ? rawParticipants : [];
 
     for (const p of participants) {
       if (!p.leftAt && p.joinedAt) {
-        p.leftAt = now;
         const sessionSecs = Math.max(
           0,
           Math.round((now.getTime() - new Date(p.joinedAt).getTime()) / 1000),
         );
-        p.durationSeconds = (p.durationSeconds || 0) + sessionSecs;
-        await p.save();
+        await this.prisma.classroomParticipant.update({
+          where: { id: p.id },
+          data: {
+            leftAt: now,
+            durationSeconds: (p.durationSeconds || 0) + sessionSecs,
+          },
+        });
       }
     }
+
+    this.logger.log(
+      `Classroom [${code}] automatically ended due to inactivity (no participants connected).`,
+    );
+
+    this.broadcastToClassroom(classroom.code, 'classroom:ended', {
+      classroomCode: classroom.code,
+      endedAt: now,
+      reason: 'INACTIVITY',
+      message: 'Classroom was automatically closed due to inactivity',
+    });
   }
 
   private async handleUserExitedClassroom(code: string, user: AuthenticatedUser) {
@@ -471,31 +299,39 @@ export class ClassroomGateway
       activeSet.delete(user.id);
 
       // Record leftAt and compute duration in DB
-      const classroom = await this.classroomModel.findOne({ code });
+      const classroom = await this.prisma.classroom.findUnique({ where: { code } });
       if (classroom) {
-        const participant = await this.participantModel.findOne({
-          classroomId: classroom._id,
-          userId: new Types.ObjectId(user.id),
+        const participant = await this.prisma.classroomParticipant.findUnique({
+          where: {
+            classroomId_userId: {
+              classroomId: classroom.id,
+              userId: user.id,
+            },
+          },
         });
 
         if (participant && participant.joinedAt) {
           const now = new Date();
-          participant.leftAt = now;
           const sessionSecs = Math.max(
             0,
             Math.round((now.getTime() - new Date(participant.joinedAt).getTime()) / 1000),
           );
-          participant.durationSeconds = (participant.durationSeconds || 0) + sessionSecs;
-          await participant.save();
+          await this.prisma.classroomParticipant.update({
+            where: { id: participant.id },
+            data: {
+              leftAt: now,
+              durationSeconds: (participant.durationSeconds || 0) + sessionSecs,
+            },
+          });
         }
       }
 
-      // If classroom is now completely empty, start 5-minute inactivity timer!
+      // If classroom is now completely empty, start inactivity timer!
       if (activeSet.size === 0) {
         this.logger.warn(
-          `All participants have exited classroom [${code}]. Scheduling auto-ending in 5 mins.`,
+          `All participants have exited classroom [${code}]. Scheduling auto-deletion/ending in 60s.`,
         );
-        this.scheduleInactivityTimer(code, this.INACTIVITY_LIMIT_MS);
+        this.scheduleInactivityTimer(code, 60000);
       }
     }
   }
@@ -504,11 +340,6 @@ export class ClassroomGateway
   // CLASSROOM LIFECYCLE EVENTS
   // ==========================================
 
-  /**
-   * Host forwards accept decision → relays to student via socket.
-   * This handles the case where the REST-triggered emitToUser() may have missed
-   * the student due to a socket reconnect after request submission.
-   */
   @SubscribeMessage('classroom:request:accepted')
   async handleRequestAccepted(
     @ConnectedSocket() client: Socket,
@@ -518,16 +349,14 @@ export class ClassroomGateway
     const code = payload.classroomCode?.toUpperCase().trim();
     if (!code || !payload.userId) return;
 
-    const classroom = await this.classroomModel.findOne({ code });
+    const classroom = await this.prisma.classroom.findUnique({ where: { code } });
     if (!classroom) return;
 
-    // Only host can call this
-    if (classroom.hostId.toString() !== user.id) return;
+    if (classroom.hostId !== user.id) return;
 
-    // Re-emit accepted notification directly to student
     this.notifyStudentAccepted(payload.userId, {
       classroomCode: code,
-      classroomId: classroom._id.toString(),
+      classroomId: classroom.id,
       status: ParticipantStatus.ACCEPTED,
       message: 'Your join request was accepted by the host',
     });
@@ -535,9 +364,6 @@ export class ClassroomGateway
     return { success: true };
   }
 
-  /**
-   * Host forwards reject decision → relays to student via socket.
-   */
   @SubscribeMessage('classroom:request:rejected')
   async handleRequestRejected(
     @ConnectedSocket() client: Socket,
@@ -547,14 +373,14 @@ export class ClassroomGateway
     const code = payload.classroomCode?.toUpperCase().trim();
     if (!code || !payload.userId) return;
 
-    const classroom = await this.classroomModel.findOne({ code });
+    const classroom = await this.prisma.classroom.findUnique({ where: { code } });
     if (!classroom) return;
 
-    if (classroom.hostId.toString() !== user.id) return;
+    if (classroom.hostId !== user.id) return;
 
     this.notifyStudentRejected(payload.userId, {
       classroomCode: code,
-      classroomId: classroom._id.toString(),
+      classroomId: classroom.id,
       status: ParticipantStatus.REJECTED,
       message: 'Your join request was rejected by the host',
     });
@@ -562,11 +388,6 @@ export class ClassroomGateway
     return { success: true };
   }
 
-  /**
-   * Student polls their own join-request status.
-   * Emits classroom:request:status back to the caller with current DB status.
-   * The frontend can call this on reconnect to check if already accepted/rejected.
-   */
   @SubscribeMessage('classroom:request:status')
   async handleRequestStatus(
     @ConnectedSocket() client: Socket,
@@ -576,29 +397,32 @@ export class ClassroomGateway
     const code = payload.classroomCode?.toUpperCase().trim();
     if (!code) return;
 
-    const classroom = await this.classroomModel.findOne({ code });
+    const classroom = await this.prisma.classroom.findUnique({ where: { code } });
     if (!classroom) return;
 
-    const participant = await this.participantModel.findOne({
-      classroomId: classroom._id,
-      userId: new Types.ObjectId(user.id),
+    const participant = await this.prisma.classroomParticipant.findUnique({
+      where: {
+        classroomId_userId: {
+          classroomId: classroom.id,
+          userId: user.id,
+        },
+      },
     });
 
     const status = participant?.status || null;
     client.emit('classroom:request:status', { classroomCode: code, status });
 
-    // If accepted, also emit the full acceptance event so the frontend navigates
     if (status === ParticipantStatus.ACCEPTED) {
       client.emit('classroom:request:accepted', {
         classroomCode: code,
-        classroomId: classroom._id.toString(),
+        classroomId: classroom.id,
         status: ParticipantStatus.ACCEPTED,
         message: 'Your join request was accepted by the host',
       });
     } else if (status === ParticipantStatus.REJECTED) {
       client.emit('classroom:request:rejected', {
         classroomCode: code,
-        classroomId: classroom._id.toString(),
+        classroomId: classroom.id,
         status: ParticipantStatus.REJECTED,
         message: 'Your join request was rejected by the host',
       });
@@ -613,15 +437,12 @@ export class ClassroomGateway
     @MessageBody() dto: any,
   ) {
     this.getAuthUser(client);
-    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    const code = client.data.classroomCode || dto?.classroomCode;
     if (!code) return { success: false };
 
     const tab = dto?.tab || dto?.activeTab;
     if (!tab) return { success: false };
 
-    this.recordActivity(code);
-
-    // Broadcast to all other participants in the room
     client.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: tab, tab });
     return { success: true };
   }
@@ -632,15 +453,9 @@ export class ClassroomGateway
     @MessageBody() dto: JoinRoomDto,
   ) {
     const user = this.getAuthUser(client);
-    const rawCode = dto?.classroomCode || (dto as any)?.code || client.data.classroomCode || '';
-    const code = rawCode.toUpperCase().trim();
+    const code = dto.classroomCode.toUpperCase().trim();
 
-    if (!code) {
-      throw new WsException('classroomCode is required');
-    }
-
-    // Verify classroom exists & ACTIVE
-    const classroom = await this.classroomModel.findOne({ code });
+    const classroom = await this.prisma.classroom.findUnique({ where: { code } });
     if (!classroom) {
       throw new WsException('Classroom not found');
     }
@@ -648,142 +463,115 @@ export class ClassroomGateway
       throw new WsException('Classroom is not active or has already ended');
     }
 
-    // Verify participant is ACCEPTED
-    let participant = await this.participantModel.findOne({
-      classroomId: classroom._id,
-      userId: new Types.ObjectId(user.id),
-      status: ParticipantStatus.ACCEPTED,
+    const participant = await this.prisma.classroomParticipant.findUnique({
+      where: {
+        classroomId_userId: {
+          classroomId: classroom.id,
+          userId: user.id,
+        },
+      },
     });
 
-    if (!participant) {
-      if (classroom.hostId.toString() === user.id) {
-        participant = await this.participantModel.findOneAndUpdate(
-          { classroomId: classroom._id, userId: new Types.ObjectId(user.id) },
-          {
-            classroomId: classroom._id,
-            userId: new Types.ObjectId(user.id),
-            role: ParticipantRole.HOST,
-            status: ParticipantStatus.ACCEPTED,
-            joinedAt: new Date(),
-          },
-          { upsert: true, new: true },
-        );
-      } else {
-        throw new WsException('Access denied: You are not an accepted participant of this classroom');
-      }
-    }
-
-    if (!participant) {
+    if (!participant || participant.status !== ParticipantStatus.ACCEPTED) {
       throw new WsException('Access denied: You are not an accepted participant of this classroom');
     }
 
-    // Cancel any pending inactivity timer because someone joined!
     this.clearInactivityTimer(code);
 
-    // Track user in active classroom users
     if (!this.classroomActiveUsers.has(code)) {
       this.classroomActiveUsers.set(code, new Set());
     }
     this.classroomActiveUsers.get(code)!.add(user.id);
 
-    // Update participant session joinedAt
-    participant.joinedAt = new Date();
-    participant.leftAt = null;
-    await participant.save();
+    await this.prisma.classroomParticipant.update({
+      where: { id: participant.id },
+      data: {
+        joinedAt: new Date(),
+        leftAt: null,
+      },
+    });
 
     const roomName = `classroom:${code}`;
     await client.join(roomName);
     client.data.classroomCode = code;
-    client.data.classroomId = classroom._id.toString();
+    client.data.classroomId = classroom.id;
     client.data.role = participant.role;
 
-    // Fetch accepted participants
-    const participants = await this.participantModel
-      .find({
-        classroomId: classroom._id,
+    const participants = await this.prisma.classroomParticipant.findMany({
+      where: {
+        classroomId: classroom.id,
         status: ParticipantStatus.ACCEPTED,
-      })
-      .populate('userId', 'name email avatar')
-      .exec();
-
-    const formattedParticipants = participants.map((p) => {
-      const u = p.userId as any;
-      return {
-        userId: u?._id ? u._id.toString() : p.userId.toString(),
-        name: u?.name || 'Unknown',
-        email: u?.email || '',
-        avatar: u?.avatar || null,
-        role: p.role,
-        status: p.status,
-        joinedAt: p.joinedAt,
-        leftAt: p.leftAt || null,
-        durationSeconds: p.durationSeconds || 0,
-        durationFormatted: formatDuration(p.durationSeconds || 0),
-      };
+      },
+      include: {
+        user: { select: { id: true, name: true, email: true, avatar: true } },
+      },
+      orderBy: { joinedAt: 'asc' },
     });
 
-    // Fetch whiteboard operations
-    const whiteboardOps = await this.whiteboardService.getOperations(classroom._id.toString());
+    const formattedParticipants = participants.map((p) => ({
+      userId: p.user.id,
+      name: p.user.name,
+      email: p.user.email,
+      avatar: p.user.avatar,
+      role: p.role,
+      status: p.status,
+      joinedAt: p.joinedAt,
+      leftAt: p.leftAt || null,
+      durationSeconds: p.durationSeconds || 0,
+      durationFormatted: formatDuration(p.durationSeconds || 0),
+    }));
 
-    // Ensure 2-hour duration limit and 5-minute advance warning timers are running
-    this.ensureClassroomTimers(classroom);
+    const whiteboardOps = await this.whiteboardService.getOperations(classroom.id);
 
-    // Record activity to reset 5-minute inactivity timer
-    this.recordActivity(code);
+    const activePdf = classroom.activePdfFileName
+      ? {
+          fileName: classroom.activePdfFileName,
+          fileUrl: classroom.activePdfFileUrl || '',
+          totalPages: classroom.activePdfTotalPages || 1,
+          currentPage: classroom.activePdfCurrentPage || 1,
+        }
+      : null;
 
-    // Compute remaining time in 2-hour window
-    const createdAtMs = new Date(classroom.createdAt).getTime();
-    const elapsedMs = Math.max(0, Date.now() - createdAtMs);
-    const remainingMs = Math.max(0, this.MAX_SESSION_DURATION_MS - elapsedMs);
-    const timeLimit = {
-      maxDurationSeconds: Math.round(this.MAX_SESSION_DURATION_MS / 1000), // 7200
-      elapsedSeconds: Math.round(elapsedMs / 1000),
-      remainingSeconds: Math.round(remainingMs / 1000),
-      isWarning: remainingMs <= this.WARNING_BEFORE_END_MS,
-      warningMessage: 'Classroom exceeding time limit, Please create another after it ended.',
-    };
-
-    // Send complete classroom state to the joining participant
     const statePayload = {
       classroom: {
-        id: classroom._id.toString(),
+        id: classroom.id,
         name: classroom.name,
         code: classroom.code,
-        hostId: classroom.hostId.toString(),
+        hostId: classroom.hostId,
         status: classroom.status,
       },
       participants: formattedParticipants,
-      activePdf: classroom.activePdf || null,
+      activePdf,
       whiteboard: whiteboardOps,
-      timeLimit,
     };
 
     client.emit('classroom:state', statePayload);
 
-    // Notify other participants in the room
     client.to(roomName).emit('classroom:user-joined', {
       userId: user.id,
       name: user.name,
       role: participant.role,
+      joinedAt: new Date(),
     });
 
-    this.logger.log(`User ${user.email} joined socket room: ${roomName} (Active count: ${this.classroomActiveUsers.get(code)?.size})`);
-    return { success: true, message: `Joined classroom ${code}` };
+    this.logger.log(`User ${user.email} (${participant.role}) joined Socket.IO room ${roomName}`);
+    return { success: true, classroom: statePayload.classroom };
   }
 
   @SubscribeMessage('classroom:leave')
   async handleLeaveClassroom(
     @ConnectedSocket() client: Socket,
-    @MessageBody() dto: LeaveRoomDto,
+    @MessageBody() dto?: LeaveRoomDto,
   ) {
     const user = this.getAuthUser(client);
-    const code = dto.classroomCode.toUpperCase().trim();
-    const roomName = `classroom:${code}`;
+    const code = (dto?.classroomCode || client.data.classroomCode || '').toUpperCase().trim();
 
+    if (!code) {
+      throw new WsException('Classroom code is required');
+    }
+
+    const roomName = `classroom:${code}`;
     await client.leave(roomName);
-    delete client.data.classroomCode;
-    delete client.data.classroomId;
-    delete client.data.role;
 
     await this.handleUserExitedClassroom(code, user);
 
@@ -792,7 +580,11 @@ export class ClassroomGateway
       name: user.name,
     });
 
-    this.logger.log(`User ${user.email} left socket room: ${roomName}`);
+    delete client.data.classroomCode;
+    delete client.data.classroomId;
+    delete client.data.role;
+
+    this.logger.log(`User ${user.email} left Socket.IO room ${roomName}`);
     return { success: true, message: `Left classroom ${code}` };
   }
 
@@ -803,54 +595,28 @@ export class ClassroomGateway
   @SubscribeMessage('whiteboard:draw')
   async handleWhiteboardDraw(
     @ConnectedSocket() client: Socket,
-    @MessageBody() dto: any,
+    @MessageBody() dto: WhiteboardDrawDto,
   ) {
     const user = this.getAuthUser(client);
-    let code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
-    let classroomId = client.data.classroomId;
-
-    if (!classroomId && code) {
-      const room = await this.classroomModel.findOne({ code });
-      if (room) {
-        classroomId = room._id.toString();
-        client.data.classroomId = classroomId;
-        client.data.classroomCode = code;
-      }
-    }
+    const code = client.data.classroomCode;
+    const classroomId = client.data.classroomId;
 
     if (!code || !classroomId) {
       throw new WsException('You must join a classroom first before drawing');
     }
 
-    this.recordActivity(code);
-
-    // Extract coordinates from either flat payload or nested { data: { ... } }
-    const payload = dto?.data || dto;
-    const x1 = payload?.x1;
-    const y1 = payload?.y1;
-    const x2 = payload?.x2;
-    const y2 = payload?.y2;
-    const color = payload?.color || '#000000';
-    const width = Number(payload?.width) || 3;
-
-    if (x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined) {
-      this.logger.warn(`whiteboard:draw ignored: missing coordinates in ${JSON.stringify(dto)}`);
-      return { success: false, message: 'Invalid coordinates' };
-    }
-
     const op = await this.whiteboardService.saveOperation(classroomId, user.id, {
       type: WhiteboardOperationType.DRAW,
-      x1,
-      y1,
-      x2,
-      y2,
-      color,
-      width,
+      x1: dto.x1,
+      y1: dto.y1,
+      x2: dto.x2,
+      y2: dto.y2,
+      color: dto.color || '#000000',
+      width: dto.width,
     });
 
-    // Broadcast to all participants in the room
-    const broadcastPayload = {
-      id: op._id.toString(),
+    this.server.to(`classroom:${code}`).emit('whiteboard:draw', {
+      id: op.id,
       userId: user.id,
       type: op.type,
       x1: op.x1,
@@ -860,67 +626,35 @@ export class ClassroomGateway
       color: op.color,
       width: op.width,
       createdAt: op.createdAt,
-      data: {
-        x1: op.x1,
-        y1: op.y1,
-        x2: op.x2,
-        y2: op.y2,
-        color: op.color,
-        width: op.width,
-      },
-    };
+    });
 
-    client.to(`classroom:${code}`).emit('whiteboard:draw', broadcastPayload);
-
-    return { success: true, operation: broadcastPayload };
+    return { success: true };
   }
 
   @SubscribeMessage('whiteboard:erase')
   async handleWhiteboardErase(
     @ConnectedSocket() client: Socket,
-    @MessageBody() dto: any,
+    @MessageBody() dto: WhiteboardEraseDto,
   ) {
     const user = this.getAuthUser(client);
-    let code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
-    let classroomId = client.data.classroomId;
-
-    if (!classroomId && code) {
-      const room = await this.classroomModel.findOne({ code });
-      if (room) {
-        classroomId = room._id.toString();
-        client.data.classroomId = classroomId;
-        client.data.classroomCode = code;
-      }
-    }
+    const code = client.data.classroomCode;
+    const classroomId = client.data.classroomId;
 
     if (!code || !classroomId) {
       throw new WsException('You must join a classroom first before erasing');
     }
 
-    this.recordActivity(code);
-
-    const payload = dto?.data || dto;
-    const x1 = payload?.x1;
-    const y1 = payload?.y1;
-    const x2 = payload?.x2;
-    const y2 = payload?.y2;
-    const width = Number(payload?.width) || 10;
-
-    if (x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined) {
-      return { success: false, message: 'Invalid coordinates' };
-    }
-
     const op = await this.whiteboardService.saveOperation(classroomId, user.id, {
       type: WhiteboardOperationType.ERASE,
-      x1,
-      y1,
-      x2,
-      y2,
-      width,
+      x1: dto.x1,
+      y1: dto.y1,
+      x2: dto.x2,
+      y2: dto.y2,
+      width: dto.width,
     });
 
-    const broadcastPayload = {
-      id: op._id.toString(),
+    this.server.to(`classroom:${code}`).emit('whiteboard:erase', {
+      id: op.id,
       userId: user.id,
       type: op.type,
       x1: op.x1,
@@ -929,43 +663,25 @@ export class ClassroomGateway
       y2: op.y2,
       width: op.width,
       createdAt: op.createdAt,
-      data: {
-        x1: op.x1,
-        y1: op.y1,
-        x2: op.x2,
-        y2: op.y2,
-        width: op.width,
-      },
-    };
-
-    client.to(`classroom:${code}`).emit('whiteboard:erase', broadcastPayload);
+    });
 
     return { success: true };
   }
 
   @SubscribeMessage('whiteboard:clear')
-  async handleWhiteboardClear(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() dto: any,
-  ) {
+  async handleWhiteboardClear(@ConnectedSocket() client: Socket) {
     const user = this.getAuthUser(client);
-    let code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
-    let classroomId = client.data.classroomId;
-
-    if (!classroomId && code) {
-      const room = await this.classroomModel.findOne({ code });
-      if (room) {
-        classroomId = room._id.toString();
-        client.data.classroomId = classroomId;
-        client.data.classroomCode = code;
-      }
-    }
+    const code = client.data.classroomCode;
+    const classroomId = client.data.classroomId;
+    const role = client.data.role;
 
     if (!code || !classroomId) {
       throw new WsException('You must join a classroom first');
     }
 
-    this.recordActivity(code);
+    if (role !== ParticipantRole.HOST) {
+      throw new WsException('Forbidden: Only the host can clear the whiteboard');
+    }
 
     await this.whiteboardService.clearOperations(classroomId);
 
@@ -974,47 +690,30 @@ export class ClassroomGateway
       timestamp: new Date().toISOString(),
     });
 
-    this.logger.log(`Whiteboard cleared for classroom ${code} by ${user.email}`);
+    this.logger.log(`Whiteboard cleared for classroom ${code} by host ${user.email}`);
     return { success: true };
   }
 
   @SubscribeMessage('whiteboard:state')
-  async handleWhiteboardState(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() dto: any,
-  ) {
+  async handleWhiteboardState(@ConnectedSocket() client: Socket) {
     this.getAuthUser(client);
-    let code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
-    let classroomId = client.data.classroomId;
-
-    if (!classroomId && code) {
-      const room = await this.classroomModel.findOne({ code });
-      if (room) {
-        classroomId = room._id.toString();
-        client.data.classroomId = classroomId;
-        client.data.classroomCode = code;
-      }
-    }
+    const classroomId = client.data.classroomId;
 
     if (!classroomId) {
       throw new WsException('You must join a classroom first');
     }
 
-    if (code) {
-      this.recordActivity(code);
-    }
-
     const operations = await this.whiteboardService.getOperations(classroomId);
     client.emit('whiteboard:state', { operations });
-    return { success: true };
+    return { success: true, count: operations.length };
   }
 
   // ==========================================
-  // PDF SYNCHRONIZATION EVENTS
+  // PDF SHARING EVENTS
   // ==========================================
 
   @SubscribeMessage('pdf:share')
-  async handlePdfShare(
+  async handleSharePdf(
     @ConnectedSocket() client: Socket,
     @MessageBody() dto: SharePdfDto,
   ) {
@@ -1024,26 +723,21 @@ export class ClassroomGateway
 
     let classroom = null;
     if (code) {
-      classroom = await this.classroomModel.findOne({ code });
+      classroom = await this.prisma.classroom.findUnique({ where: { code } });
     } else if (classroomId) {
-      classroom = await this.classroomModel.findById(new Types.ObjectId(classroomId));
+      classroom = await this.prisma.classroom.findUnique({ where: { id: classroomId } });
       if (classroom) code = classroom.code;
     }
 
     if (!classroom) {
-      this.logger.warn(`pdf:share failed: Classroom not found for code '${code}'`);
       throw new WsException('Classroom not found');
     }
-    classroomId = classroom._id.toString();
+    classroomId = classroom.id;
 
-    // Verify user is host
-    const isHost = classroom.hostId.toString() === user.id;
-    if (!isHost) {
-      this.logger.warn(`pdf:share failed: User ${user.email} is not host of classroom ${code}`);
+    if (classroom.hostId !== user.id) {
       throw new WsException('Forbidden: Only the host can share a PDF');
     }
 
-    // Ensure socket state is set and joined to room
     client.data.classroomCode = code;
     client.data.classroomId = classroomId;
     client.data.role = ParticipantRole.HOST;
@@ -1051,8 +745,7 @@ export class ClassroomGateway
 
     const activePdf = await this.pdfService.sharePdf(classroomId, dto);
 
-    this.logger.log(`PDF shared in classroom ${code} by ${user.email}: ${dto.fileName}. Broadcasting to classroom:${code}`);
-    this.recordActivity(code);
+    this.logger.log(`PDF shared in classroom ${code} by ${user.email}: ${dto.fileName}`);
     this.server.to(`classroom:${code}`).emit('pdf:shared', activePdf);
     return { success: true, activePdf };
   }
@@ -1068,27 +761,24 @@ export class ClassroomGateway
 
     let classroom = null;
     if (code) {
-      classroom = await this.classroomModel.findOne({ code });
+      classroom = await this.prisma.classroom.findUnique({ where: { code } });
     } else if (classroomId) {
-      classroom = await this.classroomModel.findById(new Types.ObjectId(classroomId));
+      classroom = await this.prisma.classroom.findUnique({ where: { id: classroomId } });
       if (classroom) code = classroom.code;
     }
 
     if (!classroom) {
       throw new WsException('Classroom not found');
     }
-    classroomId = classroom._id.toString();
+    classroomId = classroom.id;
 
-    const isHost = classroom.hostId.toString() === user.id;
-    if (!isHost) {
+    if (classroom.hostId !== user.id) {
       throw new WsException('Forbidden: Only the host can change PDF pages');
     }
 
     client.data.classroomCode = code;
     client.data.classroomId = classroomId;
     client.data.role = ParticipantRole.HOST;
-
-    this.recordActivity(code);
 
     const page = typeof dto?.page === 'number' ? dto.page : dto?.currentPage || 1;
     const activePdf = await this.pdfService.changePage(classroomId, page);
@@ -1111,27 +801,25 @@ export class ClassroomGateway
 
     let classroom = null;
     if (code) {
-      classroom = await this.classroomModel.findOne({ code });
+      classroom = await this.prisma.classroom.findUnique({ where: { code } });
     } else if (classroomId) {
-      classroom = await this.classroomModel.findById(new Types.ObjectId(classroomId));
+      classroom = await this.prisma.classroom.findUnique({ where: { id: classroomId } });
       if (classroom) code = classroom.code;
     }
 
     if (!classroom) {
       throw new WsException('Classroom not found');
     }
-    classroomId = classroom._id.toString();
+    classroomId = classroom.id;
 
-    const isHost = classroom.hostId.toString() === user.id;
-    if (!isHost) {
+    if (classroom.hostId !== user.id) {
       throw new WsException('Forbidden: Only the host can close the PDF');
     }
-
-    this.recordActivity(code);
 
     await this.pdfService.closePdf(classroomId);
 
     this.server.to(`classroom:${code}`).emit('pdf:closed', {
+      closedBy: user.id,
       timestamp: new Date().toISOString(),
     });
 
@@ -1147,7 +835,6 @@ export class ClassroomGateway
     const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
     if (!code) return { success: false };
 
-    this.recordActivity(code);
     client.to(`classroom:${code}`).emit('pdf:annotate', dto);
     return { success: true };
   }
@@ -1161,7 +848,6 @@ export class ClassroomGateway
     const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
     if (!code) return { success: false };
 
-    this.recordActivity(code);
     client.to(`classroom:${code}`).emit('pdf:erase', dto);
     return { success: true };
   }
@@ -1175,7 +861,6 @@ export class ClassroomGateway
     const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
     if (!code) return { success: false };
 
-    this.recordActivity(code);
     client.to(`classroom:${code}`).emit('pdf:clear-annotations', dto);
     return { success: true };
   }
@@ -1192,9 +877,6 @@ export class ClassroomGateway
     const user = this.getAuthUser(client);
     const targetUserId = dto.targetUserId;
     if (!targetUserId) return { success: false };
-
-    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
-    if (code) this.recordActivity(code);
 
     const offer = dto.offer || dto.data;
 
@@ -1217,9 +899,6 @@ export class ClassroomGateway
     const targetUserId = dto.targetUserId;
     if (!targetUserId) return { success: false };
 
-    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
-    if (code) this.recordActivity(code);
-
     const answer = dto.answer || dto.data;
 
     this.emitToUser(targetUserId, 'webrtc:answer', {
@@ -1240,9 +919,6 @@ export class ClassroomGateway
     const user = this.getAuthUser(client);
     const targetUserId = dto.targetUserId;
     if (!targetUserId) return { success: false };
-
-    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
-    if (code) this.recordActivity(code);
 
     const candidate = dto.candidate || dto.data;
 
@@ -1266,8 +942,6 @@ export class ClassroomGateway
     const rawCode = client.data.classroomCode || dto?.classroomCode;
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
-
-    this.recordActivity(code);
 
     client.to(`classroom:${code}`).emit('screenshare:started', {
       classroomCode: code,
@@ -1298,12 +972,10 @@ export class ClassroomGateway
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
 
-    this.recordActivity(code);
-
-    const classroom = await this.classroomModel.findOne({ code });
+    const classroom = await this.prisma.classroom.findUnique({ where: { code } });
     if (!classroom) return { success: false };
 
-    this.emitToUser(classroom.hostId.toString(), 'webrtc:student-ready', {
+    this.emitToUser(classroom.hostId, 'webrtc:student-ready', {
       studentId: user.id,
       classroomCode: code,
     });
@@ -1319,8 +991,6 @@ export class ClassroomGateway
     const rawCode = client.data.classroomCode || dto?.classroomCode;
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
-
-    this.recordActivity(code);
 
     client.to(`classroom:${code}`).emit('screenshare:stopped', { classroomCode: code });
     client.to(`classroom:${code}`).emit('webrtc:screen-stopped', { classroomCode: code });
@@ -1349,14 +1019,11 @@ export class ClassroomGateway
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
 
-    this.recordActivity(code);
-
     if (!this.voiceChatActivePeers.has(code)) {
       this.voiceChatActivePeers.set(code, new Map());
     }
     const peerMap = this.voiceChatActivePeers.get(code)!;
 
-    // Collect all other active peers in this classroom
     const existingPeers: Array<{ userId: string; userName: string; hasVideo: boolean }> = [];
     peerMap.forEach((info, peerUserId) => {
       if (peerUserId !== user.id) {
@@ -1368,19 +1035,16 @@ export class ClassroomGateway
       }
     });
 
-    // Register this user
     peerMap.set(user.id, {
       userName: user.name,
       hasVideo: dto?.hasVideo ?? false,
     });
 
-    // Send the list of existing active peers back to the newly joined peer
     client.emit('voicechat:peers', {
       classroomCode: code,
       peers: existingPeers,
     });
 
-    // Broadcast to everyone else in the room
     client.to(`classroom:${code}`).emit('voicechat:joined', {
       userId: user.id,
       userName: user.name,
@@ -1418,8 +1082,6 @@ export class ClassroomGateway
   ) {
     const user = this.getAuthUser(client);
     if (!dto?.targetUserId || !dto?.offer) return { success: false };
-    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
-    if (code) this.recordActivity(code);
     this.emitToUser(dto.targetUserId, 'voicechat:offer', {
       fromUserId: user.id,
       fromUserName: user.name,
@@ -1435,8 +1097,6 @@ export class ClassroomGateway
   ) {
     const user = this.getAuthUser(client);
     if (!dto?.targetUserId || !dto?.answer) return { success: false };
-    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
-    if (code) this.recordActivity(code);
     this.emitToUser(dto.targetUserId, 'voicechat:answer', {
       fromUserId: user.id,
       answer: dto.answer,
@@ -1451,8 +1111,6 @@ export class ClassroomGateway
   ) {
     const user = this.getAuthUser(client);
     if (!dto?.targetUserId || !dto?.candidate) return { success: false };
-    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
-    if (code) this.recordActivity(code);
     this.emitToUser(dto.targetUserId, 'voicechat:ice-candidate', {
       fromUserId: user.id,
       candidate: dto.candidate,
@@ -1466,9 +1124,8 @@ export class ClassroomGateway
     @MessageBody() dto: any,
   ) {
     const user = this.getAuthUser(client);
-    const code = (client.data.classroomCode || dto?.classroomCode || '').toUpperCase().trim();
+    const code = client.data.classroomCode || dto?.classroomCode;
     if (!code) return { success: false };
-    this.recordActivity(code);
     client.to(`classroom:${code}`).emit('voicechat:mute-state', {
       userId: user.id,
       audioMuted: dto?.audioMuted ?? false,
@@ -1486,13 +1143,11 @@ export class ClassroomGateway
     const code = client.data.classroomCode || dto?.classroomCode;
     if (!code || !dto?.targetUserId) return { success: false };
 
-    // Verify the caller is the host
-    const classroom = await this.classroomModel.findOne({ code });
-    if (!classroom || classroom.hostId.toString() !== user.id) {
+    const classroom = await this.prisma.classroom.findUnique({ where: { code } });
+    if (!classroom || classroom.hostId !== user.id) {
       return { success: false, message: 'Only host can force mute' };
     }
 
-    // Forward the mute command to the target user
     this.emitToUser(dto.targetUserId, 'voicechat:force-mute', {
       fromUserId: user.id,
     });
@@ -1512,6 +1167,12 @@ export class ClassroomGateway
       return true;
     }
     return false;
+  }
+
+  emitToUsers(userIds: string[], event: string, payload: any) {
+    for (const id of userIds) {
+      this.emitToUser(id, event, payload);
+    }
   }
 
   broadcastToClassroom(classroomCode: string, event: string, payload: any) {

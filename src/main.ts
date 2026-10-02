@@ -9,7 +9,6 @@ import path from 'path';
 import { AppModule } from './app.module.js';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter.js';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor.js';
-import { parseAllowedOrigins, isOriginAllowed } from './common/utils/cors.util.js';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
@@ -19,9 +18,8 @@ async function bootstrap() {
   const port = configService.get<number>('port') || 3000;
   const frontendUrl =
     configService.get<string>('frontendUrl') || 'http://localhost:5173';
-  const allowedOrigins = parseAllowedOrigins(frontendUrl);
 
-  // Security: Helmet middleware (configured to allow hosted frontend embeds and resources)
+  // Security: Helmet middleware (relaxed for universal access from anywhere)
   app.use(
     helmet({
       contentSecurityPolicy: false,
@@ -31,19 +29,9 @@ async function bootstrap() {
     }),
   );
 
-  // Security: CORS (Restricted to configured hosted frontend origin(s))
+  // Security: CORS (Supports all frontend origins dynamically with credentials)
   app.enableCors({
-    origin: (
-      origin: string | undefined,
-      callback: (err: Error | null, allow?: boolean) => void,
-    ) => {
-      if (isOriginAllowed(origin, allowedOrigins)) {
-        callback(null, true);
-      } else {
-        logger.warn(`Blocked CORS request from unauthorized origin: ${origin}`);
-        callback(new Error(`Origin ${origin} is not allowed by CORS policy.`));
-      }
-    },
+    origin: true,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
     allowedHeaders: [
@@ -60,25 +48,18 @@ async function bootstrap() {
     maxAge: 86400,
   });
 
-  // Serve static uploads (for shared PDF files, restricted to allowed origins)
+  // Serve static uploads (for shared PDF files)
   const uploadsDir = path.join(process.cwd(), 'uploads');
   app.use(
     '/uploads',
-    (req: express.Request, res: express.Response, next: express.NextFunction) => {
-      const origin = req.headers.origin;
-      if (origin && isOriginAllowed(origin, allowedOrigins)) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-        res.setHeader('Access-Control-Allow-Credentials', 'true');
+    express.static(uploadsDir, {
+      setHeaders: (res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', '*');
-      }
-      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-      if (req.method === 'OPTIONS') {
-        return res.sendStatus(204);
-      }
-      next();
-    },
-    express.static(uploadsDir),
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      },
+    }),
   );
 
   // Global Validation Pipe
@@ -137,7 +118,7 @@ async function bootstrap() {
   logger.log(`Network Access:   http://0.0.0.0:${port} (Accessible from any network/IP)`);
   logger.log(`Swagger Docs:     http://localhost:${port}/api/docs`);
   logger.log(`Socket.IO URL:    http://localhost:${port}/classroom`);
-  logger.log(`Allowed CORS:     ${allowedOrigins.join(', ')}`);
+  logger.log(`Universal CORS:   ENABLED for all origins (*)`);
   logger.log(`=================================================`);
 }
 

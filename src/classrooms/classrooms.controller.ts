@@ -41,6 +41,20 @@ export class ClassroomsController {
     return this.classroomsService.createClassroom(dto, user);
   }
 
+  @Get()
+  @ApiOperation({ summary: 'Get current user recent classrooms with real-time active status' })
+  @ApiResponse({ status: 200, description: 'List of recent classrooms returned' })
+  async getRecent(@CurrentUser() user: AuthenticatedUser) {
+    return this.classroomsService.getRecentClassrooms(user);
+  }
+
+  @Get('recent')
+  @ApiOperation({ summary: 'Get current user recent classrooms (alias)' })
+  @ApiResponse({ status: 200, description: 'List of recent classrooms returned' })
+  async getRecentAlias(@CurrentUser() user: AuthenticatedUser) {
+    return this.classroomsService.getRecentClassrooms(user);
+  }
+
   // ==========================================
   // DASHBOARD HISTORY ENDPOINTS
   // Defined before /:code to avoid route collision
@@ -68,30 +82,6 @@ export class ClassroomsController {
   })
   async getStudentHistory(@CurrentUser() user: AuthenticatedUser) {
     return this.classroomsService.getStudentHistory(user.id);
-  }
-
-  @Get('recent')
-  @ApiOperation({
-    summary: 'Dashboard: Get recent classrooms created or joined with live status (ACTIVE or ENDED)',
-  })
-  @ApiResponse({
-    status: 200,
-    description: 'Recent classrooms with real-time status returned',
-  })
-  async getRecent(@CurrentUser() user: AuthenticatedUser) {
-    return this.classroomsService.getRecentClassrooms(user.id);
-  }
-
-  @Get('analytics')
-  @ApiOperation({
-    summary: 'Dashboard: Get aggregated teaching and learning analytics',
-  })
-  @ApiResponse({
-    status: 200,
-    description: 'Classroom analytics data returned for host or student',
-  })
-  async getAnalytics(@CurrentUser() user: AuthenticatedUser) {
-    return this.classroomsService.getAnalytics(user.id);
   }
 
   // ==========================================

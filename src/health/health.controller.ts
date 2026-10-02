@@ -1,15 +1,13 @@
 import { Controller, Get, Optional } from '@nestjs/common';
 import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
-import { InjectConnection } from '@nestjs/mongoose';
-import type { Connection } from 'mongoose';
+import { PrismaService } from '../prisma/prisma.service.js';
 
 @ApiTags('Health')
 @Controller('health')
 export class HealthController {
   constructor(
     @Optional()
-    @InjectConnection()
-    private readonly connection?: Connection,
+    private readonly prisma?: PrismaService,
   ) {}
 
   @Get()
@@ -27,8 +25,16 @@ export class HealthController {
       },
     },
   })
-  check() {
-    const isDbConnected = Boolean(this.connection && this.connection.readyState === 1);
+  async check() {
+    let isDbConnected = false;
+    if (this.prisma) {
+      try {
+        await this.prisma.$queryRaw`SELECT 1`;
+        isDbConnected = true;
+      } catch {
+        isDbConnected = false;
+      }
+    }
 
     return {
       success: true,

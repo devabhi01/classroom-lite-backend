@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { Model } from 'mongoose';
-import { ClassroomDocument } from '../schemas/classroom.schema.js';
+import { PrismaService } from '../../prisma/prisma.service.js';
 
 @Injectable()
 export class ClassroomCodeGenerator {
@@ -8,10 +7,12 @@ export class ClassroomCodeGenerator {
   private readonly charset = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   private readonly codeLength = 6;
 
+  constructor(private readonly prisma: PrismaService) {}
+
   /**
    * Generates a unique 6-character classroom code and ensures no collision in database
    */
-  async generateUniqueCode(classroomModel: Model<ClassroomDocument>): Promise<string> {
+  async generateUniqueCode(): Promise<string> {
     const maxAttempts = 10;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       let code = '';
@@ -20,7 +21,9 @@ export class ClassroomCodeGenerator {
         code += this.charset[randomIndex];
       }
 
-      const exists = await classroomModel.exists({ code });
+      const exists = await this.prisma.classroom.findUnique({
+        where: { code },
+      });
       if (!exists) {
         return code;
       }

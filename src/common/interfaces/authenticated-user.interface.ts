@@ -3,4 +3,5 @@ export interface AuthenticatedUser {
   email: string;
   name: string;
   avatar?: string;
+  role?: string;
 }

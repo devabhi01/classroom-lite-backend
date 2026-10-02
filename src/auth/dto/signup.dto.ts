@@ -1,5 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import {
+  IsArray,
   IsEmail,
   IsNotEmpty,
   IsOptional,
@@ -48,13 +49,47 @@ export class SignupDto {
   @IsString()
   avatar?: string;
 
-  @ApiProperty({ example: 'TEACHER', required: false, description: 'Role of the user (e.g. TEACHER or STUDENT)' })
+  @ApiProperty({ example: 'TEACHER', required: false, description: 'Role of the user (TEACHER or STUDENT)' })
   @IsOptional()
   @IsString()
   role?: string;
 
-  @ApiProperty({ example: '+919876543210', required: false, description: 'User phone number for SMS OTP verification' })
+  // --- Teacher Institution Options (Part 9, 10, 11) ---
+  @ApiProperty({
+    example: 'ABC Computer Institute',
+    required: false,
+    description: 'Teacher signup option: Name to create their own basic institution',
+  })
   @IsOptional()
   @IsString()
-  phone?: string;
+  institutionName?: string;
+
+  @ApiProperty({
+    example: 'd8c47f7d-9839-4b29-c9ef-6c41b80456aa',
+    required: false,
+    description: 'Teacher signup option: ID of existing institution to request to join',
+  })
+  @IsOptional()
+  @IsString()
+  institutionId?: string;
+
+  @ApiProperty({
+    example: 'TDP82K4',
+    required: false,
+    description: 'Teacher signup option: Code of existing institution to request to join',
+  })
+  @IsOptional()
+  @IsString()
+  institutionCode?: string;
+
+  // --- Student Institution Options (Part 12, 13) ---
+  @ApiProperty({
+    example: ['d8c47f7d-9839-4b29-c9ef-6c41b80456aa'],
+    required: false,
+    description: 'Student signup option: Array of institution IDs to send join requests to',
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  institutionIds?: string[];
 }

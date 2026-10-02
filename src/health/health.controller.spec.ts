@@ -3,18 +3,17 @@ import { HealthController } from './health.controller.js';
 
 describe('HealthController', () => {
   let controller: HealthController;
-  let mockConnection: any;
+  let mockPrisma: any;
 
   beforeEach(() => {
-    mockConnection = {
-      readyState: 1,
+    mockPrisma = {
+      $queryRaw: vi.fn().mockResolvedValue([{ '?column?': 1 }]),
     };
-    controller = new HealthController(mockConnection);
+    controller = new HealthController(mockPrisma);
   });
 
-  it('should return connected database status when readyState is 1', () => {
-    mockConnection.readyState = 1;
-    const result = controller.check();
+  it('should return connected database status when PostgreSQL query succeeds', async () => {
+    const result = await controller.check();
     expect(result.success).toBe(true);
     expect(result.status).toBe('ok');
     expect(result.service).toBe('tdp-classroom-lite-backend');
@@ -22,15 +21,15 @@ describe('HealthController', () => {
     expect(result.timestamp).toBeDefined();
   });
 
-  it('should return disconnected database status when readyState is not 1', () => {
-    mockConnection.readyState = 0;
-    const result = controller.check();
+  it('should return disconnected database status when PostgreSQL query fails', async () => {
+    mockPrisma.$queryRaw.mockRejectedValue(new Error('Connection failed'));
+    const result = await controller.check();
     expect(result.database).toBe('disconnected');
   });
 
-  it('should handle undefined connection gracefully and return disconnected', () => {
+  it('should handle undefined prisma gracefully and return disconnected', async () => {
     const noConnController = new HealthController(undefined);
-    const result = noConnController.check();
+    const result = await noConnController.check();
     expect(result.success).toBe(true);
     expect(result.database).toBe('disconnected');
   });

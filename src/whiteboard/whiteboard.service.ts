@@ -1,20 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
-import {
-  WhiteboardOperation,
-  WhiteboardOperationDocument,
-} from './schemas/whiteboard-operation.schema.js';
-import { WhiteboardOperationType } from '../common/constants/statuses.enum.js';
+import { WhiteboardOperationType } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service.js';
 
 @Injectable()
 export class WhiteboardService {
   private readonly logger = new Logger(WhiteboardService.name);
 
-  constructor(
-    @InjectModel(WhiteboardOperation.name)
-    private readonly operationModel: Model<WhiteboardOperationDocument>,
-  ) {}
+  constructor(private readonly prisma: PrismaService) {}
 
   async saveOperation(
     classroomId: string,
@@ -28,33 +20,34 @@ export class WhiteboardService {
       color?: string;
       width: number;
     },
-  ): Promise<WhiteboardOperationDocument> {
-    const doc = new this.operationModel({
-      classroomId: new Types.ObjectId(classroomId),
-      userId: new Types.ObjectId(userId),
-      type: operation.type,
-      x1: operation.x1,
-      y1: operation.y1,
-      x2: operation.x2,
-      y2: operation.y2,
-      color: operation.color,
-      width: operation.width,
+  ) {
+    return this.prisma.whiteboardOperation.create({
+      data: {
+        classroomId,
+        userId,
+        type: operation.type,
+        x1: operation.x1,
+        y1: operation.y1,
+        x2: operation.x2,
+        y2: operation.y2,
+        color: operation.color || null,
+        width: operation.width,
+      },
     });
-    return doc.save();
   }
 
-  async getOperations(classroomId: string): Promise<WhiteboardOperation[]> {
-    return this.operationModel
-      .find({ classroomId: new Types.ObjectId(classroomId) })
-      .sort({ createdAt: 1 })
-      .exec();
+  async getOperations(classroomId: string) {
+    return this.prisma.whiteboardOperation.findMany({
+      where: { classroomId },
+      orderBy: { createdAt: 'asc' },
+    });
   }
 
   async clearOperations(classroomId: string): Promise<number> {
-    const result = await this.operationModel
-      .deleteMany({ classroomId: new Types.ObjectId(classroomId) })
-      .exec();
-    this.logger.log(`Cleared ${result.deletedCount} whiteboard operations for classroom: ${classroomId}`);
-    return result.deletedCount || 0;
+    const result = await this.prisma.whiteboardOperation.deleteMany({
+      where: { classroomId },
+    });
+    this.logger.log(`Cleared ${result.count} whiteboard operations for classroom: ${classroomId}`);
+    return result.count;
   }
 }
