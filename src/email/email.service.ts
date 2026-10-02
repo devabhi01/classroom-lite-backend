@@ -8,8 +8,24 @@ export class EmailService {
   private transporter: Transporter | null = null;
   private readonly isConfigured: boolean = false;
   private readonly fromAddress: string;
+  private readonly fromName: string;
+  private readonly fromEmail: string;
+  private readonly brevoApiKey: string;
+  private readonly resendApiKey: string;
 
   constructor(private readonly configService: ConfigService) {
+    this.brevoApiKey = (
+      this.configService.get<string>('BREVO_API_KEY') ||
+      process.env.BREVO_API_KEY ||
+      ''
+    ).trim().replace(/^['"]|['"]$/g, '');
+
+    this.resendApiKey = (
+      this.configService.get<string>('RESEND_API_KEY') ||
+      process.env.RESEND_API_KEY ||
+      ''
+    ).trim().replace(/^['"]|['"]$/g, '');
+
     const rawUser =
       this.configService.get<string>('SMTP_USER') ||
       this.configService.get<string>('GMAIL_USER') ||
@@ -57,7 +73,17 @@ export class EmailService {
       cleanedFrom ||
       `"TDP Classroom Lite" <${user || 'noreply@tdpclassroom.com'}>`;
 
-    if (user && pass) {
+    const match = this.fromAddress.match(/"?([^"<]+)"?\s*<([^>]+)>/);
+    this.fromName = match ? match[1].trim() : 'TDP Classroom Lite';
+    this.fromEmail = match ? match[2].trim() : (user || 'info.tdpclassroom@gmail.com');
+
+    if (this.brevoApiKey) {
+      this.isConfigured = true;
+      this.logger.log('EmailService: Configured using Brevo HTTPS REST API (Port 443, Render-compatible)');
+    } else if (this.resendApiKey) {
+      this.isConfigured = true;
+      this.logger.log('EmailService: Configured using Resend HTTPS REST API (Port 443, Render-compatible)');
+    } else if (user && pass) {
       const isGmail = host.includes('gmail') || user.endsWith('@gmail.com');
       const transportOptions: any = {
         host: isGmail ? 'smtp.gmail.com' : host,
@@ -79,7 +105,7 @@ export class EmailService {
     } else {
       this.isConfigured = false;
       this.logger.warn(
-        'EmailService: No SMTP credentials configured (GMAIL_USER and GMAIL_APP_PASSWORD not set). Real emails will NOT be sent; OTP codes will be printed to server console.',
+        'EmailService: No email credentials configured. Real emails will NOT be sent; OTP codes will be printed to server console.',
       );
     }
   }
@@ -139,9 +165,76 @@ export class EmailService {
     // Always log OTP to server console for testing/debugging
     this.logger.log(`\n==================================================\n📧 [EMAIL VERIFICATION OTP]\nTo: ${to} (${name})\nOTP Code: [ ${otp} ] (Valid for 15 mins)\n==================================================`);
 
+    // 1. Try Brevo HTTPS REST API (Port 443 - Works seamlessly on Render Free Tier)
+    if (this.brevoApiKey) {
+      try {
+        const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST',
+          headers: {
+            accept: 'application/json',
+            'api-key': this.brevoApiKey,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            sender: { name: this.fromName, email: this.fromEmail },
+            to: [{ email: to, name: name || 'User' }],
+            subject,
+            htmlContent: html,
+          }),
+        });
+
+        if (res.ok) {
+          this.logger.log(`Verification email sent successfully via Brevo HTTPS API to ${to}`);
+          return true;
+        } else {
+          const errData = await res.text();
+          this.logger.error(`Brevo API returned error: ${errData}. OTP code [ ${otp} ] remains valid.`);
+          return false;
+        }
+      } catch (err: any) {
+        this.logger.error(`Failed to send email via Brevo: ${err.message}. OTP code [ ${otp} ] remains valid.`);
+        return false;
+      }
+    }
+
+    // 2. Try Resend HTTPS REST API (Port 443 - Works seamlessly on Render Free Tier)
+    if (this.resendApiKey) {
+      try {
+        const fromHeader = this.fromAddress.includes('@')
+          ? this.fromAddress
+          : 'TDP Classroom Lite <onboarding@resend.dev>';
+        const res = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.resendApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            from: fromHeader,
+            to: [to],
+            subject,
+            html,
+          }),
+        });
+
+        if (res.ok) {
+          this.logger.log(`Verification email sent successfully via Resend HTTPS API to ${to}`);
+          return true;
+        } else {
+          const errData = await res.text();
+          this.logger.error(`Resend API returned error: ${errData}. OTP code [ ${otp} ] remains valid.`);
+          return false;
+        }
+      } catch (err: any) {
+        this.logger.error(`Failed to send email via Resend: ${err.message}. OTP code [ ${otp} ] remains valid.`);
+        return false;
+      }
+    }
+
+    // 3. Fallback: Nodemailer SMTP (Works locally or on paid VPS/Render with unblocked SMTP ports)
     if (!this.isConfigured || !this.transporter) {
       this.logger.warn(
-        `Email not delivered via SMTP: GMAIL_USER / GMAIL_APP_PASSWORD not set in environment variables. Use the OTP code [ ${otp} ] above to verify.`,
+        `Email not delivered via SMTP: No SMTP credentials configured. Use the OTP code [ ${otp} ] above to verify.`,
       );
       return true;
     }
