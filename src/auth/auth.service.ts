@@ -63,9 +63,10 @@ export class AuthService {
           passwordHash,
           avatar: signupDto.avatar || null,
           role: userRole,
-          isEmailVerified: false,
-          emailVerificationOtp: verificationOtp,
-          emailVerificationExpires: verificationExpires,
+          // isEmailVerified: false,
+          // emailVerificationOtp: verificationOtp,
+          // emailVerificationExpires: verificationExpires,
+          isEmailVerified: true, // EMAIL VERIFICATION DISABLED FOR NOW: Users are auto-verified on signup
         },
       });
 
@@ -161,6 +162,7 @@ export class AuthService {
     });
 
     // Send verification email with 6-digit OTP (fast-release with background completion)
+    /* EMAIL VERIFICATION DISABLED FOR NOW
     Promise.race([
       this.emailService.sendVerificationOtp(
         user.email,
@@ -171,6 +173,7 @@ export class AuthService {
     ]).catch((err) => {
       this.logger.warn(`Background email dispatch warning for ${user.email}: ${err.message}`);
     });
+    */
 
     const payload: JwtPayload = {
       sub: user.id,
@@ -178,16 +181,16 @@ export class AuthService {
     };
     const accessToken = this.jwtService.sign(payload);
 
-    this.logger.log(`User signed up successfully: ${user.email} (${user.role}) [Unverified]`);
+    this.logger.log(`User signed up successfully: ${user.email} (${user.role}) [Auto-verified]`);
 
     return {
       success: true,
-      message: 'Account created! Please enter the 6-digit verification code sent to your email.',
-      requiresVerification: true,
+      message: 'Account created successfully! Welcome.',
+      requiresVerification: false,
       data: {
         user: this.usersService.sanitizeUser(user),
         accessToken,
-        requiresVerification: true,
+        requiresVerification: false,
       },
     };
   }
@@ -208,6 +211,7 @@ export class AuthService {
     }
 
     // Check if email is verified
+    /* EMAIL VERIFICATION DISABLED FOR NOW
     if (!user.isEmailVerified) {
       // Generate a fresh OTP and resend
       const otp = Math.floor(100000 + Math.random() * 900000).toString();
@@ -235,6 +239,7 @@ export class AuthService {
         email: user.email,
       });
     }
+    */
 
     const payload: JwtPayload = {
       sub: user.id,
