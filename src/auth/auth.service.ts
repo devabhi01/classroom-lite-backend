@@ -155,6 +155,9 @@ export class AuthService {
       }
 
       return createdUser;
+    }, {
+      maxWait: 15000,
+      timeout: 30000,
     });
 
     // Send verification email with 6-digit OTP
