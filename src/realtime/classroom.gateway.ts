@@ -62,6 +62,9 @@ export class ClassroomGateway
   // Map: classroomCode -> Map<userId, { userName: string; hasVideo: boolean }>
   private readonly voiceChatActivePeers = new Map<string, Map<string, { userName: string; hasVideo: boolean }>>();
 
+  // Map: classroomCode -> current active tab ('whiteboard' | 'pdf' | 'screenshare' | 'interaction')
+  private readonly classroomActiveTabs = new Map<string, string>();
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
@@ -443,7 +446,10 @@ export class ClassroomGateway
     const tab = dto?.tab || dto?.activeTab;
     if (!tab) return { success: false };
 
-    client.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: tab, tab });
+    const cleanCode = code.toUpperCase().trim();
+    this.classroomActiveTabs.set(cleanCode, tab);
+
+    client.to(`classroom:${cleanCode}`).emit('classroom:tab-change', { activeTab: tab, tab });
     return { success: true };
   }
 
@@ -532,6 +538,7 @@ export class ClassroomGateway
         }
       : null;
 
+    const activeTab = this.classroomActiveTabs.get(code) || (activePdf ? 'pdf' : 'whiteboard');
     const statePayload = {
       classroom: {
         id: classroom.id,
@@ -541,6 +548,7 @@ export class ClassroomGateway
         status: classroom.status,
       },
       participants: formattedParticipants,
+      activeTab,
       activePdf,
       whiteboard: whiteboardOps,
     };
@@ -746,7 +754,9 @@ export class ClassroomGateway
     const activePdf = await this.pdfService.sharePdf(classroomId, dto);
 
     this.logger.log(`PDF shared in classroom ${code} by ${user.email}: ${dto.fileName}`);
+    this.classroomActiveTabs.set(code, 'pdf');
     this.server.to(`classroom:${code}`).emit('pdf:shared', activePdf);
+    this.server.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: 'pdf', tab: 'pdf' });
     return { success: true, activePdf };
   }
 
@@ -818,10 +828,12 @@ export class ClassroomGateway
 
     await this.pdfService.closePdf(classroomId);
 
+    this.classroomActiveTabs.set(code, 'whiteboard');
     this.server.to(`classroom:${code}`).emit('pdf:closed', {
       closedBy: user.id,
       timestamp: new Date().toISOString(),
     });
+    this.server.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: 'whiteboard', tab: 'whiteboard' });
 
     return { success: true };
   }
@@ -943,6 +955,7 @@ export class ClassroomGateway
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
 
+    this.classroomActiveTabs.set(code, 'screenshare');
     client.to(`classroom:${code}`).emit('screenshare:started', {
       classroomCode: code,
       hostId: user.id,
@@ -951,6 +964,7 @@ export class ClassroomGateway
       classroomCode: code,
       hostId: user.id,
     });
+    client.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: 'screenshare', tab: 'screenshare' });
     return { success: true };
   }
 
@@ -992,8 +1006,13 @@ export class ClassroomGateway
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
 
+    const classroom = await this.prisma.classroom.findUnique({ where: { code } });
+    const fallbackTab = classroom?.activePdfFileName ? 'pdf' : 'whiteboard';
+    this.classroomActiveTabs.set(code, fallbackTab);
+
     client.to(`classroom:${code}`).emit('screenshare:stopped', { classroomCode: code });
     client.to(`classroom:${code}`).emit('webrtc:screen-stopped', { classroomCode: code });
+    client.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: fallbackTab, tab: fallbackTab });
     return { success: true };
   }
 
