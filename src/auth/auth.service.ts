@@ -160,12 +160,17 @@ export class AuthService {
       timeout: 30000,
     });
 
-    // Send verification email with 6-digit OTP
-    await this.emailService.sendVerificationOtp(
-      user.email,
-      user.name,
-      user.emailVerificationOtp || verificationOtp,
-    );
+    // Send verification email with 6-digit OTP (fast-release with background completion)
+    Promise.race([
+      this.emailService.sendVerificationOtp(
+        user.email,
+        user.name,
+        user.emailVerificationOtp || verificationOtp,
+      ),
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]).catch((err) => {
+      this.logger.warn(`Background email dispatch warning for ${user.email}: ${err.message}`);
+    });
 
     const payload: JwtPayload = {
       sub: user.id,
@@ -216,7 +221,12 @@ export class AuthService {
         },
       });
 
-      await this.emailService.sendVerificationOtp(user.email, user.name, otp);
+      Promise.race([
+        this.emailService.sendVerificationOtp(user.email, user.name, otp),
+        new Promise((resolve) => setTimeout(resolve, 1500)),
+      ]).catch((err) => {
+        this.logger.warn(`Email delivery warning during unverified login: ${err.message}`);
+      });
 
       throw new UnauthorizedException({
         statusCode: 401,
@@ -326,7 +336,12 @@ export class AuthService {
       },
     });
 
-    await this.emailService.sendVerificationOtp(user.email, user.name, otp);
+    Promise.race([
+      this.emailService.sendVerificationOtp(user.email, user.name, otp),
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]).catch((err) => {
+      this.logger.warn(`Email delivery warning during resend: ${err.message}`);
+    });
 
     return {
       success: true,
