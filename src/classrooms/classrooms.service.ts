@@ -914,6 +914,7 @@ export class ClassroomsService {
           createdAt: c.createdAt,
           endedAt: c.endedAt,
           participantCount: c._count.participants,
+          activeParticipantCount: this.classroomGateway?.getActiveParticipantCount(c.code) || 0,
         })),
       };
     } else {
@@ -993,6 +994,7 @@ export class ClassroomsService {
             createdAt: a.classroom.createdAt,
             endedAt: a.classroom.endedAt,
             participantCount: a.classroom._count.participants,
+            activeParticipantCount: this.classroomGateway?.getActiveParticipantCount(a.classroom.code) || 0,
           });
         }
       }
@@ -1012,6 +1014,7 @@ export class ClassroomsService {
             createdAt: r.createdAt,
             endedAt: r.endedAt,
             participantCount: r._count.participants,
+            activeParticipantCount: this.classroomGateway?.getActiveParticipantCount(r.code) || 0,
           });
         }
       }
