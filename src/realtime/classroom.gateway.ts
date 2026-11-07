@@ -62,6 +62,9 @@ export class ClassroomGateway
   // Map: classroomCode -> Map<userId, { userName: string; hasVideo: boolean }>
   private readonly voiceChatActivePeers = new Map<string, Map<string, { userName: string; hasVideo: boolean }>>();
 
+  // Map: classroomCode -> current active tab ('whiteboard' | 'pdf' | 'screenshare' | 'interaction')
+  private readonly classroomActiveTabs = new Map<string, string>();
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
@@ -443,7 +446,10 @@ export class ClassroomGateway
     const tab = dto?.tab || dto?.activeTab;
     if (!tab) return { success: false };
 
-    client.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: tab, tab });
+    const cleanCode = code.toUpperCase().trim();
+    this.classroomActiveTabs.set(cleanCode, tab);
+
+    client.to(`classroom:${cleanCode}`).emit('classroom:tab-change', { activeTab: tab, tab });
     return { success: true };
   }
 
@@ -532,6 +538,7 @@ export class ClassroomGateway
         }
       : null;
 
+    const activeTab = this.classroomActiveTabs.get(code) || (activePdf ? 'pdf' : 'whiteboard');
     const statePayload = {
       classroom: {
         id: classroom.id,
@@ -541,6 +548,7 @@ export class ClassroomGateway
         status: classroom.status,
       },
       participants: formattedParticipants,
+      activeTab,
       activePdf,
       whiteboard: whiteboardOps,
     };
@@ -598,35 +606,53 @@ export class ClassroomGateway
     @MessageBody() dto: WhiteboardDrawDto,
   ) {
     const user = this.getAuthUser(client);
-    const code = client.data.classroomCode;
-    const classroomId = client.data.classroomId;
+    let code = client.data.classroomCode || (dto as any)?.classroomCode;
+    let classroomId = client.data.classroomId || (dto as any)?.classroomId;
+
+    if (!classroomId && code) {
+      const room = await this.prisma.classroom.findUnique({
+        where: { code: code.toUpperCase().trim() },
+      });
+      if (room) {
+        classroomId = room.id;
+        code = room.code;
+        client.data.classroomId = room.id;
+        client.data.classroomCode = room.code;
+        await client.join(`classroom:${room.code}`);
+      }
+    }
 
     if (!code || !classroomId) {
       throw new WsException('You must join a classroom first before drawing');
     }
 
-    const op = await this.whiteboardService.saveOperation(classroomId, user.id, {
-      type: WhiteboardOperationType.DRAW,
+    // 1. BROADCAST IMMEDIATELY TO PEERS (Zero pen delay!)
+    client.to(`classroom:${code}`).emit('whiteboard:draw', {
+      userId: user.id,
+      type: 'draw',
       x1: dto.x1,
       y1: dto.y1,
       x2: dto.x2,
       y2: dto.y2,
       color: dto.color || '#000000',
       width: dto.width,
+      createdAt: new Date().toISOString(),
     });
 
-    this.server.to(`classroom:${code}`).emit('whiteboard:draw', {
-      id: op.id,
-      userId: user.id,
-      type: op.type,
-      x1: op.x1,
-      y1: op.y1,
-      x2: op.x2,
-      y2: op.y2,
-      color: op.color,
-      width: op.width,
-      createdAt: op.createdAt,
-    });
+    // 2. Persist in background asynchronously without blocking WebSocket broadcast
+    this.whiteboardService
+      .saveOperation(classroomId, user.id, {
+        type: WhiteboardOperationType.DRAW,
+        x1: dto.x1,
+        y1: dto.y1,
+        x2: dto.x2,
+        y2: dto.y2,
+        color: dto.color || '#000000',
+        width: dto.width,
+      })
+      .catch((err) => {
+        this.logger.warn(`Failed to persist whiteboard draw: ${err.message}`);
+      });
 
     return { success: true };
   }
@@ -637,43 +663,79 @@ export class ClassroomGateway
     @MessageBody() dto: WhiteboardEraseDto,
   ) {
     const user = this.getAuthUser(client);
-    const code = client.data.classroomCode;
-    const classroomId = client.data.classroomId;
+    let code = client.data.classroomCode || (dto as any)?.classroomCode;
+    let classroomId = client.data.classroomId || (dto as any)?.classroomId;
+
+    if (!classroomId && code) {
+      const room = await this.prisma.classroom.findUnique({
+        where: { code: code.toUpperCase().trim() },
+      });
+      if (room) {
+        classroomId = room.id;
+        code = room.code;
+        client.data.classroomId = room.id;
+        client.data.classroomCode = room.code;
+        await client.join(`classroom:${room.code}`);
+      }
+    }
 
     if (!code || !classroomId) {
       throw new WsException('You must join a classroom first before erasing');
     }
 
-    const op = await this.whiteboardService.saveOperation(classroomId, user.id, {
-      type: WhiteboardOperationType.ERASE,
+    // 1. BROADCAST IMMEDIATELY TO PEERS
+    client.to(`classroom:${code}`).emit('whiteboard:erase', {
+      userId: user.id,
+      type: 'erase',
       x1: dto.x1,
       y1: dto.y1,
       x2: dto.x2,
       y2: dto.y2,
       width: dto.width,
+      createdAt: new Date().toISOString(),
     });
 
-    this.server.to(`classroom:${code}`).emit('whiteboard:erase', {
-      id: op.id,
-      userId: user.id,
-      type: op.type,
-      x1: op.x1,
-      y1: op.y1,
-      x2: op.x2,
-      y2: op.y2,
-      width: op.width,
-      createdAt: op.createdAt,
-    });
+    // 2. Persist in background
+    this.whiteboardService
+      .saveOperation(classroomId, user.id, {
+        type: WhiteboardOperationType.ERASE,
+        x1: dto.x1,
+        y1: dto.y1,
+        x2: dto.x2,
+        y2: dto.y2,
+        width: dto.width,
+      })
+      .catch((err) => {
+        this.logger.warn(`Failed to persist whiteboard erase: ${err.message}`);
+      });
 
     return { success: true };
   }
 
   @SubscribeMessage('whiteboard:clear')
-  async handleWhiteboardClear(@ConnectedSocket() client: Socket) {
+  async handleWhiteboardClear(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() dto?: any,
+  ) {
     const user = this.getAuthUser(client);
-    const code = client.data.classroomCode;
-    const classroomId = client.data.classroomId;
-    const role = client.data.role;
+    let code = client.data.classroomCode || dto?.classroomCode;
+    let classroomId = client.data.classroomId || dto?.classroomId;
+    let role = client.data.role;
+
+    if (!classroomId && code) {
+      const room = await this.prisma.classroom.findUnique({
+        where: { code: code.toUpperCase().trim() },
+      });
+      if (room) {
+        classroomId = room.id;
+        code = room.code;
+        role = room.hostId === user.id ? ParticipantRole.HOST : ParticipantRole.STUDENT;
+        client.data.classroomId = room.id;
+        client.data.classroomCode = room.code;
+        client.data.role = role;
+        await client.join(`classroom:${room.code}`);
+      }
+    }
 
     if (!code || !classroomId) {
       throw new WsException('You must join a classroom first');
@@ -695,9 +757,25 @@ export class ClassroomGateway
   }
 
   @SubscribeMessage('whiteboard:state')
-  async handleWhiteboardState(@ConnectedSocket() client: Socket) {
+  async handleWhiteboardState(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() dto?: any,
+  ) {
     this.getAuthUser(client);
-    const classroomId = client.data.classroomId;
+    let classroomId = client.data.classroomId || dto?.classroomId;
+    const code = client.data.classroomCode || dto?.classroomCode;
+
+    if (!classroomId && code) {
+      const room = await this.prisma.classroom.findUnique({
+        where: { code: code.toUpperCase().trim() },
+      });
+      if (room) {
+        classroomId = room.id;
+        client.data.classroomId = room.id;
+        client.data.classroomCode = room.code;
+        await client.join(`classroom:${room.code}`);
+      }
+    }
 
     if (!classroomId) {
       throw new WsException('You must join a classroom first');
@@ -746,7 +824,9 @@ export class ClassroomGateway
     const activePdf = await this.pdfService.sharePdf(classroomId, dto);
 
     this.logger.log(`PDF shared in classroom ${code} by ${user.email}: ${dto.fileName}`);
+    this.classroomActiveTabs.set(code, 'pdf');
     this.server.to(`classroom:${code}`).emit('pdf:shared', activePdf);
+    this.server.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: 'pdf', tab: 'pdf' });
     return { success: true, activePdf };
   }
 
@@ -818,10 +898,12 @@ export class ClassroomGateway
 
     await this.pdfService.closePdf(classroomId);
 
+    this.classroomActiveTabs.set(code, 'whiteboard');
     this.server.to(`classroom:${code}`).emit('pdf:closed', {
       closedBy: user.id,
       timestamp: new Date().toISOString(),
     });
+    this.server.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: 'whiteboard', tab: 'whiteboard' });
 
     return { success: true };
   }
@@ -943,6 +1025,7 @@ export class ClassroomGateway
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
 
+    this.classroomActiveTabs.set(code, 'screenshare');
     client.to(`classroom:${code}`).emit('screenshare:started', {
       classroomCode: code,
       hostId: user.id,
@@ -951,6 +1034,7 @@ export class ClassroomGateway
       classroomCode: code,
       hostId: user.id,
     });
+    client.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: 'screenshare', tab: 'screenshare' });
     return { success: true };
   }
 
@@ -992,8 +1076,13 @@ export class ClassroomGateway
     if (!rawCode) return { success: false };
     const code = rawCode.toUpperCase().trim();
 
+    const classroom = await this.prisma.classroom.findUnique({ where: { code } });
+    const fallbackTab = classroom?.activePdfFileName ? 'pdf' : 'whiteboard';
+    this.classroomActiveTabs.set(code, fallbackTab);
+
     client.to(`classroom:${code}`).emit('screenshare:stopped', { classroomCode: code });
     client.to(`classroom:${code}`).emit('webrtc:screen-stopped', { classroomCode: code });
+    client.to(`classroom:${code}`).emit('classroom:tab-change', { activeTab: fallbackTab, tab: fallbackTab });
     return { success: true };
   }
 
